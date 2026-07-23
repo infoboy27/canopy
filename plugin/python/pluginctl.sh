@@ -120,7 +120,7 @@ setup_venv_if_needed() {
 
 get_process_cmd() {
     local pid="$1"
-    ps -p "$pid" -o args= 2>/dev/null || ps -p "$pid" -o command= 2>/dev/null
+    tr '\0' ' ' < /proc/"$pid"/cmdline 2>/dev/null
 }
 
 # Check if the process is running based on PID file
@@ -136,7 +136,7 @@ is_running() {
         return 1
     fi
     # Check if process exists and is running our Python script
-    if ps -p "$pid" > /dev/null 2>&1; then
+    if kill -0 "$pid" 2>/dev/null; then
         # Verify it's actually our Python script
         if get_process_cmd "$pid" | grep -q "python.*main.py"; then
             return 0
@@ -226,7 +226,7 @@ stop() {
     # Wait for process to exit with timeout
     local count=0
     while [ $count -lt $STOP_TIMEOUT ]; do
-        if ! ps -p "$pid" > /dev/null 2>&1; then
+        if ! kill -0 "$pid" 2>/dev/null; then
             echo "Python plugin stopped successfully"
             cleanup_pid
             return 0
@@ -239,7 +239,7 @@ stop() {
     kill -KILL "$pid" 2>/dev/null
     sleep 1
     # Verify it's stopped
-    if ! ps -p "$pid" > /dev/null 2>&1; then
+    if ! kill -0 "$pid" 2>/dev/null; then
         echo "Python plugin stopped (forced)"
         cleanup_pid
         return 0

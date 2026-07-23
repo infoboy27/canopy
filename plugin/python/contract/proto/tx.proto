@@ -56,3 +56,157 @@ message Signature {
   // signature: the bytes of the signature output from a private key which may be verified with the message and public
   bytes signature = 2;
 }
+
+// Example: MessageReward mints tokens to a recipient
+message MessageReward {
+  // admin_address: the admin authorizing the reward
+  bytes admin_address = 1; // @gotags: json:"adminAddress"
+  // recipient_address: who receives the reward
+  bytes recipient_address = 2; // @gotags: json:"recipientAddress"
+  // amount: tokens to mint
+  uint64 amount = 3;
+}
+
+// MessageFaucet is a test-only transaction that mints tokens to any address
+// No balance check required - just mints tokens for testing purposes
+message MessageFaucet {
+  // signer_address: the address signing this transaction (for auth)
+  bytes signer_address = 1; // @gotags: json:"signerAddress"
+  // recipient_address: who receives the tokens
+  bytes recipient_address = 2; // @gotags: json:"recipientAddress"
+  // amount: tokens to mint
+  uint64 amount = 3;
+}
+
+// Faucet is a state record tracking the cumulative faucet mints to a recipient (test-only)
+message Faucet {
+  // recipient_address: the address that received faucet mints
+  bytes recipient_address = 1; // @gotags: json:"recipientAddress"
+  // total_amount: the cumulative amount minted to the recipient via faucet
+  uint64 total_amount = 2; // @gotags: json:"totalAmount"
+  // count: the number of faucet transactions received
+  uint64 count = 3;
+}
+
+// Reward is a state record tracking the cumulative reward mints to a recipient
+message Reward {
+  // recipient_address: the address that received rewards
+  bytes recipient_address = 1; // @gotags: json:"recipientAddress"
+  // last_admin_address: the admin that authorized the most recent reward
+  bytes last_admin_address = 2; // @gotags: json:"lastAdminAddress"
+  // total_amount: the cumulative amount minted to the recipient via reward
+  uint64 total_amount = 3; // @gotags: json:"totalAmount"
+  // count: the number of reward transactions received
+  uint64 count = 4;
+}
+
+// -- Bingo Rush: room escrow + provably-fair commit/reveal -------------------
+
+// MessageOpenRoom opens a round and commits to a hidden seed (commit-reveal).
+message MessageOpenRoom {
+  bytes operator_address = 1; // @gotags: json:"operatorAddress"
+  bytes round_id = 2;         // @gotags: json:"roundID"
+  bytes commitment = 3;       // sha256(seed), revealed at settle
+  uint64 entry_fee = 4;       // @gotags: json:"entryFee" base entry (uCNPY) for 1 card
+  uint64 rake_bps = 5;        // @gotags: json:"rakeBps"
+  repeated uint64 payout_weights_bps = 6; // @gotags: json:"payoutWeightsBps"
+}
+
+// MessageJoinRoom escrows a player entry into an open round.
+message MessageJoinRoom {
+  bytes player_address = 1; // @gotags: json:"playerAddress"
+  bytes round_id = 2;       // @gotags: json:"roundID"
+  uint64 num_cards = 3;     // @gotags: json:"numCards"
+  uint64 amount = 4;        // coins escrowed (uCNPY)
+}
+
+// MessageSettleRoom reveals the seed and pays the verified winner from escrow.
+message MessageSettleRoom {
+  bytes operator_address = 1; // @gotags: json:"operatorAddress"
+  bytes round_id = 2;         // @gotags: json:"roundID"
+  bytes seed = 3;             // revealed; sha256(seed) must equal the commitment
+  bytes winner_address = 4;   // @gotags: json:"winnerAddress"
+  uint64 balls_drawn = 5;     // @gotags: json:"ballsDrawn"
+  string pattern = 6;         // line|row|column|diagonal|four_corners|full_house
+}
+
+// RoomRound is the on-chain state record for a round.
+message RoomRound {
+  bytes round_id = 1;         // @gotags: json:"roundID"
+  bytes operator_address = 2; // @gotags: json:"operatorAddress"
+  bytes commitment = 3;
+  uint64 entry_fee = 4;       // @gotags: json:"entryFee"
+  uint64 rake_bps = 5;        // @gotags: json:"rakeBps"
+  uint64 escrow_total = 6;    // @gotags: json:"escrowTotal"
+  uint64 num_players = 7;     // @gotags: json:"numPlayers"
+  uint32 status = 8;          // 0 = open, 1 = settled
+  repeated bytes participant_addresses = 9;   // @gotags: json:"participantAddresses"
+  repeated uint64 participant_num_cards = 10;  // @gotags: json:"participantNumCards"
+  repeated uint64 payout_weights_bps = 11;     // @gotags: json:"payoutWeightsBps"
+}
+
+// RoomParticipant records one player entry in a round.
+message RoomParticipant {
+  bytes round_id = 1;       // @gotags: json:"roundID"
+  bytes player_address = 2; // @gotags: json:"playerAddress"
+  uint64 num_cards = 3;     // @gotags: json:"numCards"
+  uint64 amount = 4;
+}
+
+// -- Bingo Rush: on-chain economy (coins/gems) + NFT cosmetics ---------------
+
+// MessageBuyCoins mints native coins to a recipient (IAP fulfillment, admin-authorised).
+message MessageBuyCoins {
+  bytes admin_address = 1;     // @gotags: json:"adminAddress"
+  bytes recipient_address = 2; // @gotags: json:"recipientAddress"
+  uint64 amount = 3;
+}
+
+// MessageBuyGems mints gems (the hard currency) to a recipient.
+message MessageBuyGems {
+  bytes admin_address = 1;     // @gotags: json:"adminAddress"
+  bytes recipient_address = 2; // @gotags: json:"recipientAddress"
+  uint64 amount = 3;
+}
+
+// MessageTransferGems moves gems between players.
+message MessageTransferGems {
+  bytes from_address = 1; // @gotags: json:"fromAddress"
+  bytes to_address = 2;   // @gotags: json:"toAddress"
+  uint64 amount = 3;
+}
+
+// MessageMintCosmetic grants a cosmetic NFT to an owner (operator-authorised).
+message MessageMintCosmetic {
+  bytes operator_address = 1; // @gotags: json:"operatorAddress"
+  bytes token_id = 2;         // @gotags: json:"tokenID"
+  string kind = 3;            // shop item id, e.g. "galaxy"
+  bytes owner_address = 4;    // @gotags: json:"ownerAddress"
+}
+
+// MessageBuyCosmetic lets a player buy a cosmetic NFT with gems (price from the catalog).
+message MessageBuyCosmetic {
+  bytes player_address = 1; // @gotags: json:"playerAddress"
+  bytes token_id = 2;       // @gotags: json:"tokenID"
+  string kind = 3;          // must be a gem-priced shop item
+}
+
+// MessageTransferCosmetic transfers ownership of a cosmetic NFT.
+message MessageTransferCosmetic {
+  bytes from_address = 1; // @gotags: json:"fromAddress"
+  bytes to_address = 2;   // @gotags: json:"toAddress"
+  bytes token_id = 3;     // @gotags: json:"tokenID"
+}
+
+// GemBalance is the per-address gem balance record.
+message GemBalance {
+  bytes address = 1;
+  uint64 amount = 2;
+}
+
+// Cosmetic is an owned NFT record (ERC-721-like).
+message Cosmetic {
+  bytes token_id = 1;      // @gotags: json:"tokenID"
+  string kind = 2;
+  bytes owner_address = 3; // @gotags: json:"ownerAddress"
+}
