@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "canopy-plugin-python"
-version = "1.0.0"
-description = "Python implementation of the Canopy blockchain plugin"
+name = "bingo-rush-plugin"
+version = "0.1.0"
+description = "Bingo Rush - Canopy nested-chain plugin (economy, NFTs, room escrow, provably-fair draw)"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
