@@ -160,6 +160,9 @@ def key_for_faucet(address: bytes) -> bytes:
     return join_len_prefix(FAUCET_PREFIX, address)
 
 
+TREASURY_ADDRESS = bytes.fromhex("a565c2cc9f4a18a62a2c6a288428850f276c8d0e")  # house treasury: rake destination (owner-controlled)
+
+
 def key_for_reward(address: bytes) -> bytes:
     """State key for a per-recipient reward record."""
     return join_len_prefix(REWARD_PREFIX, address)
@@ -849,11 +852,11 @@ class Contract:
         payouts[0] += net - sum(payouts)  # remainder to the top rank
         # read escrow, fee pool and every winner account
         escrow_key = key_for_account(escrow_address(msg.round_id))
-        fee_pool_key = key_for_fee_pool(self.config.chain_id)
+        treasury_key = key_for_account(TREASURY_ADDRESS)
         qe = random.randint(0, 2**53)
         qf = random.randint(0, 2**53)
         keys = [PluginKeyRead(query_id=qe, key=escrow_key),
-                PluginKeyRead(query_id=qf, key=fee_pool_key)]
+                PluginKeyRead(query_id=qf, key=treasury_key)]
         winner_qids = []
         for addr in winners:
             q = random.randint(0, 2**53)
@@ -866,13 +869,13 @@ class Contract:
         for r in resp.results:
             by_qid[r.query_id] = r.entries[0].value if r.entries else None
         escrow = unmarshal(Account, by_qid.get(qe)) if by_qid.get(qe) else Account()
-        fee_pool = unmarshal(Pool, by_qid.get(qf)) if by_qid.get(qf) else Pool()
+        treasury = unmarshal(Account, by_qid.get(qf)) if by_qid.get(qf) else Account()
         if escrow.amount < total:
             raise PluginError(1, "plugin", "escrow underfunded")
         escrow.amount -= total
-        fee_pool.amount += rake
+        treasury.amount += rake
         sets = [PluginSetOp(key=escrow_key, value=marshal(escrow)),
-                PluginSetOp(key=fee_pool_key, value=marshal(fee_pool))]
+                PluginSetOp(key=treasury_key, value=marshal(treasury))]
         for i, (q, addr) in enumerate(winner_qids):
             acct = unmarshal(Account, by_qid.get(q)) if by_qid.get(q) else Account()
             acct.amount += payouts[i]

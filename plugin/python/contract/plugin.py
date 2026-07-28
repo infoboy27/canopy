@@ -45,7 +45,7 @@ SOCKET_PATH = "plugin.sock"
 
 # PLUGIN_BUILD is a human-readable build marker logged at startup so operators can confirm, via
 # `tail -f /tmp/plugin/python-plugin.log`, that the running binary includes the expected features.
-PLUGIN_BUILD = "bingo-rush-plugin v0.1.0 (economy, NFT, room escrow, provably-fair multi-rank)"
+PLUGIN_BUILD = "bingo-rush-plugin v0.2.0 (rake -> house treasury; economy, NFT, room escrow, multi-rank)"
 
 
 @dataclass
