@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bingo-rush-plugin"
-version = "0.1.0"
+version = "0.2.0"
 description = "Bingo Rush - Canopy nested-chain plugin (economy, NFTs, room escrow, provably-fair draw)"
 readme = "README.md"
 license = {text = "MIT"}
