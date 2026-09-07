@@ -130,6 +130,16 @@ message MessageSettleRoom {
   string pattern = 6;         // line|row|column|diagonal|four_corners|full_house
 }
 
+// MessageExpireRoom refunds every escrowed entry for a round whose operator
+// never called MessageSettleRoom within the expiry window. Callable by ANYONE
+// once the deadline has passed (caller pays the tx fee, receives nothing) --
+// without this, an operator who never reveals the seed leaves every
+// participant's entry fee stuck in escrow with no on-chain recourse.
+message MessageExpireRoom {
+  bytes caller_address = 1; // @gotags: json:"callerAddress"
+  bytes round_id = 2;       // @gotags: json:"roundID"
+}
+
 // RoomRound is the on-chain state record for a round.
 message RoomRound {
   bytes round_id = 1;         // @gotags: json:"roundID"
@@ -139,10 +149,11 @@ message RoomRound {
   uint64 rake_bps = 5;        // @gotags: json:"rakeBps"
   uint64 escrow_total = 6;    // @gotags: json:"escrowTotal"
   uint64 num_players = 7;     // @gotags: json:"numPlayers"
-  uint32 status = 8;          // 0 = open, 1 = settled
+  uint32 status = 8;          // 0 = open, 1 = settled, 2 = expired (refunded)
   repeated bytes participant_addresses = 9;   // @gotags: json:"participantAddresses"
   repeated uint64 participant_num_cards = 10;  // @gotags: json:"participantNumCards"
   repeated uint64 payout_weights_bps = 11;     // @gotags: json:"payoutWeightsBps"
+  uint64 opened_height = 12;  // @gotags: json:"openedHeight" -- block height MessageOpenRoom landed at; the expiry deadline for MessageExpireRoom
 }
 
 // RoomParticipant records one player entry in a round.

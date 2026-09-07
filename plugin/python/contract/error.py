@@ -72,5 +72,13 @@ def err_invalid_amount() -> PluginError:
     return PluginError(13, DEFAULT_MODULE, "amount is invalid")
 
 
+def err_unauthorized_signer() -> PluginError:
+    return PluginError(15, DEFAULT_MODULE, "signer is not authorized to send this message")
+
+
+def err_room_not_expired() -> PluginError:
+    return PluginError(16, DEFAULT_MODULE, "round has not yet passed its expiry height")
+
+
 def err_tx_fee_below_state_limit() -> PluginError:
     return PluginError(14, DEFAULT_MODULE, "tx.fee is below state limit")

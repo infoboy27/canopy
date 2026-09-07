@@ -48,6 +48,7 @@ from .proto.tx_pb2 import (
     MessageOpenRoom,
     MessageJoinRoom,
     MessageSettleRoom,
+    MessageExpireRoom,
     RoomRound,
     RoomParticipant,
     MessageBuyCoins,
@@ -69,8 +70,16 @@ from .error import (
     err_insufficient_funds,
     err_tx_fee_below_state_limit,
     err_invalid_message_cast,
+    err_unauthorized_signer,
+    err_room_not_expired,
     err_unmarshal,
 )
+
+# Blocks a room may stay open before anyone can call MessageExpireRoom to
+# refund it. Tune to the chain's actual block time (this default assumes
+# ~5s blocks, i.e. ~1 hour) -- long enough that a slow-but-honest operator
+# isn't punished, short enough that abandoned rooms don't lock funds for long.
+ROOM_EXPIRY_BLOCKS = 720
 
 
 # Plugin configuration (matching Go's ContractConfig)
@@ -78,7 +87,7 @@ CONTRACT_CONFIG = {
     "name": "python_plugin_contract",
     "id": 1,
     "version": 1,
-    "supported_transactions": ["send", "faucet", "reward", "open_room", "join_room", "settle_room", "buy_coins", "buy_gems", "transfer_gems", "mint_cosmetic", "buy_cosmetic", "transfer_cosmetic"],
+    "supported_transactions": ["send", "faucet", "reward", "open_room", "join_room", "settle_room", "expire_room", "buy_coins", "buy_gems", "transfer_gems", "mint_cosmetic", "buy_cosmetic", "transfer_cosmetic"],
     "transaction_type_urls": [
         "type.googleapis.com/types.MessageSend",
         "type.googleapis.com/types.MessageFaucet",
@@ -86,6 +95,7 @@ CONTRACT_CONFIG = {
         "type.googleapis.com/types.MessageOpenRoom",
         "type.googleapis.com/types.MessageJoinRoom",
         "type.googleapis.com/types.MessageSettleRoom",
+        "type.googleapis.com/types.MessageExpireRoom",
         "type.googleapis.com/types.MessageBuyCoins",
         "type.googleapis.com/types.MessageBuyGems",
         "type.googleapis.com/types.MessageTransferGems",
@@ -161,6 +171,15 @@ def key_for_faucet(address: bytes) -> bytes:
 
 
 TREASURY_ADDRESS = bytes.fromhex("a565c2cc9f4a18a62a2c6a288428850f276c8d0e")  # house treasury: rake destination (owner-controlled)
+
+# Addresses allowed to mint (faucet/reward/buy_coins/buy_gems). Without this,
+# any signed tx naming itself as signer/admin could mint unlimited coins or
+# gems to any recipient — none of these messages carry any other proof of
+# privilege. Single-operator model for now, same as room settlement; move to
+# on-chain governance (multisig/DAO) before this chain holds real value.
+ADMIN_ADDRESSES = frozenset({
+    bytes.fromhex("fb70ee0f20168be6d3a98f13dcbab09b1ea18c65"),  # casino-gameserver operator key
+})
 
 
 def key_for_reward(address: bytes) -> bytes:
@@ -309,6 +328,10 @@ class Contract:
                 msg = MessageSettleRoom()
                 msg.ParseFromString(request.tx.msg.value)
                 return self._check_message_settle_room(msg)
+            elif type_url.endswith("/types.MessageExpireRoom"):
+                msg = MessageExpireRoom()
+                msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_expire_room(msg)
             elif type_url.endswith("/types.MessageBuyCoins"):
                 msg = MessageBuyCoins(); msg.ParseFromString(request.tx.msg.value)
                 return self._check_mint_like(msg.admin_address, msg.recipient_address, msg.amount)
@@ -363,7 +386,7 @@ class Contract:
             elif type_url.endswith("/types.MessageOpenRoom"):
                 msg = MessageOpenRoom()
                 msg.ParseFromString(request.tx.msg.value)
-                return await self._deliver_message_open_room(msg)
+                return await self._deliver_message_open_room(msg, request.height)
             elif type_url.endswith("/types.MessageJoinRoom"):
                 msg = MessageJoinRoom()
                 msg.ParseFromString(request.tx.msg.value)
@@ -372,6 +395,10 @@ class Contract:
                 msg = MessageSettleRoom()
                 msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_settle_room(msg)
+            elif type_url.endswith("/types.MessageExpireRoom"):
+                msg = MessageExpireRoom()
+                msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_message_expire_room(msg, request.height)
             elif type_url.endswith("/types.MessageBuyCoins"):
                 msg = MessageBuyCoins(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_buy_coins(msg)
@@ -540,13 +567,15 @@ class Contract:
     # ── faucet / reward (Phase 0 tutorial validation) ────────────────────────
 
     def _check_message_faucet(self, msg: MessageFaucet) -> PluginCheckResponse:
-        """Statelessly validate a 'faucet' message (test-only mint, no balance check)."""
+        """Statelessly validate a 'faucet' message (admin-only mint, no balance check)."""
         if len(msg.signer_address) != 20:
             raise err_invalid_address()
         if len(msg.recipient_address) != 20:
             raise err_invalid_address()
         if msg.amount == 0:
             raise err_invalid_amount()
+        if msg.signer_address not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
         response = PluginCheckResponse()
         response.recipient = msg.recipient_address
         response.authorized_signers.append(msg.signer_address)
@@ -560,6 +589,8 @@ class Contract:
             raise err_invalid_address()
         if msg.amount == 0:
             raise err_invalid_amount()
+        if msg.admin_address not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
         response = PluginCheckResponse()
         response.recipient = msg.recipient_address
         response.authorized_signers.append(msg.admin_address)
@@ -717,7 +748,19 @@ class Contract:
         r.authorized_signers.append(msg.operator_address)
         return r
 
-    async def _deliver_message_open_room(self, msg) -> PluginDeliverResponse:
+    def _check_message_expire_room(self, msg) -> PluginCheckResponse:
+        """Statelessly validate an 'expire_room' message. Anyone may call this
+        (they just pay their own tx fee) -- the deliver step is what actually
+        enforces the round exists, is still open, and has passed its deadline."""
+        if len(msg.caller_address) != 20:
+            raise err_invalid_address()
+        if not msg.round_id:
+            raise PluginError(1, "plugin", "empty round_id")
+        r = PluginCheckResponse()
+        r.authorized_signers.append(msg.caller_address)
+        return r
+
+    async def _deliver_message_open_room(self, msg, height: int = 0) -> PluginDeliverResponse:
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_round(msg.round_id)
@@ -736,8 +779,75 @@ class Contract:
         rr.num_players = 0
         rr.status = 0
         rr.payout_weights_bps.extend(list(msg.payout_weights_bps) or [10000])
+        rr.opened_height = height
         w = await self.plugin.state_write(self, PluginStateWriteRequest(
             sets=[PluginSetOp(key=round_key, value=marshal(rr))]))
+        out = PluginDeliverResponse()
+        if w.HasField("error"):
+            out.error.CopyFrom(w.error)
+        return out
+
+    async def _deliver_message_expire_room(self, msg, height: int = 0) -> PluginDeliverResponse:
+        """Refund every escrowed entry for a round the operator never settled
+        within ROOM_EXPIRY_BLOCKS. Each participant gets back exactly what
+        their own RoomParticipant record says they put in -- not a recomputed
+        guess -- so this can't over- or under-pay regardless of who calls it."""
+        if not self.plugin or not self.config:
+            raise PluginError(1, "plugin", "plugin or config not initialized")
+        round_key = key_for_round(msg.round_id)
+        val, err = await self._read_one(round_key)
+        if err:
+            out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
+        rr = unmarshal(RoomRound, val) if val else None
+        if rr is None:
+            raise PluginError(1, "plugin", "round not found")
+        if rr.status != 0:
+            raise PluginError(1, "plugin", "round is not open")
+        if height < rr.opened_height + ROOM_EXPIRY_BLOCKS:
+            raise err_room_not_expired()
+
+        participant_addrs = [bytes(a) for a in rr.participant_addresses]
+        escrow_key = key_for_account(escrow_address(msg.round_id))
+        qe = random.randint(0, 2**53)
+        keys = [PluginKeyRead(query_id=qe, key=escrow_key)]
+        part_qids, acct_qids = [], {}
+        for addr in participant_addrs:
+            pq = random.randint(0, 2**53)
+            aq = random.randint(0, 2**53)
+            part_qids.append((pq, addr))
+            acct_qids[addr] = aq
+            keys.append(PluginKeyRead(query_id=pq, key=key_for_participant(msg.round_id, addr)))
+            keys.append(PluginKeyRead(query_id=aq, key=key_for_account(addr)))
+        resp = await self.plugin.state_read(self, PluginStateReadRequest(keys=keys))
+        if resp.HasField("error"):
+            out = PluginDeliverResponse(); out.error.CopyFrom(resp.error); return out
+        by_qid = {}
+        for r in resp.results:
+            by_qid[r.query_id] = r.entries[0].value if r.entries else None
+
+        escrow = unmarshal(Account, by_qid.get(qe)) if by_qid.get(qe) else Account()
+        sets = []
+        total_refunded = 0
+        for pq, addr in part_qids:
+            part_bytes = by_qid.get(pq)
+            part = unmarshal(RoomParticipant, part_bytes) if part_bytes else None
+            amount = part.amount if part else 0
+            if amount <= 0:
+                continue
+            acct_bytes = by_qid.get(acct_qids[addr])
+            acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
+            acct.amount += amount
+            total_refunded += amount
+            sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
+
+        if escrow.amount < total_refunded:
+            raise PluginError(1, "plugin", "escrow underfunded")
+        escrow.amount -= total_refunded
+        sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
+        rr.status = 2  # expired/refunded
+        sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
+
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=sets))
         out = PluginDeliverResponse()
         if w.HasField("error"):
             out.error.CopyFrom(w.error)
@@ -891,10 +1001,14 @@ class Contract:
     # ── economy: coins/gems ───────────────────────────────────────────────────
 
     def _check_mint_like(self, admin, recipient, amount):
+        """Shared check for buy_coins/buy_gems — both mint unconditionally to
+        `recipient` with no balance debit, so `admin` must be a real admin."""
         if len(admin) != 20 or len(recipient) != 20:
             raise err_invalid_address()
         if amount == 0:
             raise err_invalid_amount()
+        if admin not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
         r = PluginCheckResponse()
         r.recipient = recipient
         r.authorized_signers.append(admin)
