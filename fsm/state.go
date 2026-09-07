@@ -2,8 +2,8 @@ package fsm
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
-	"math"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -16,6 +16,8 @@ import (
 const (
 	CurrentProtocolVersion         = 2
 	slowApplyTransactionsThreshold = 2 * time.Second
+	// defaultPluginStateReadLimit bounds plugin range reads when no explicit limit is provided.
+	defaultPluginStateReadLimit uint64 = 5000
 )
 
 /* This is the 'main' file of the state machine store, with the structure definition and other high level operations */
@@ -121,6 +123,9 @@ func (s *StateMachine) Initialize(store lib.StoreI) (genesis bool, err lib.Error
 	// load the previous block
 	blk, e := s.LoadBlock(s.Height() - 1)
 	if e != nil {
+		if s.height == 1 && strings.Contains(e.Error(), "block not found") {
+			return
+		}
 		return false, e
 	}
 	// set totalVDFIterations in the state machine
@@ -216,10 +221,15 @@ func (s *StateMachine) ApplyBlock(ctx context.Context, b *lib.Block, allowOversi
 	if !rootStartTime.IsZero() {
 		s.Metrics.UpdateFSMApplyBlockRootTime(rootStartTime)
 	}
-	// load the last block from the indexer
-	lastBlock, err := s.LoadBlock(s.height - 1)
-	if err != nil {
-		return nil, nil, err
+	// The state committed from genesis is version 1, but there is no indexed
+	// block yet. Treat the predecessor of the first consensus block as an empty
+	// genesis boundary; later heights must always resolve their prior block.
+	lastBlock := &lib.BlockResult{BlockHeader: new(lib.BlockHeader)}
+	if s.height > 1 {
+		lastBlock, err = s.LoadBlock(s.height - 1)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	// get the transaction root
 	transactionRoot, err := r.TransactionRoot()
@@ -262,6 +272,9 @@ func (s *StateMachine) ApplyTransactions(ctx context.Context, txs [][]byte, r *l
 	startTime := time.Now()
 	// use a map to check for 'same-block' duplicate transactions
 	deDuplicator := lib.NewDeDuplicator[string]()
+	// threshold-multisig signatures may use different valid signer subsets for the
+	// same intent, so track their stable intent IDs separately from envelope hashes.
+	multisigIntentDeDuplicator := lib.NewDeDuplicator[[crypto.HashSize]byte]()
 	// use a batch verifier for signatures
 	batchVerifier := crypto.NewBatchVerifier()
 	// get the governance parameter for max block size
@@ -271,6 +284,8 @@ func (s *StateMachine) ApplyTransactions(ctx context.Context, txs [][]byte, r *l
 	}
 	// keep a map to track transactions that failed 'check'
 	failedCheckTxs := map[int]error{}
+	// retain stable multisig intent IDs from the successful precheck pass
+	multisigIntentIDs := make([][]byte, len(txs))
 	// map signature batch indices back to original tx indices
 	batchToTxIdx := make([]int, 0, len(txs))
 	// first batch validate signatures over the entire set
@@ -282,8 +297,16 @@ func (s *StateMachine) ApplyTransactions(ctx context.Context, txs [][]byte, r *l
 		if e != nil {
 			return e
 		}
-		if _, checkErr := s.CheckTx(tx, "", batchVerifier); checkErr != nil {
+		checkResult, checkErr := s.CheckTx(tx, "", batchVerifier)
+		if checkErr != nil {
 			failedCheckTxs[i] = checkErr
+		} else {
+			intentID, intentErr := checkResult.tx.GetMultisigIntentID()
+			if intentErr != nil {
+				failedCheckTxs[i] = intentErr
+			} else {
+				multisigIntentIDs[i] = intentID
+			}
 		}
 		checkTxn.Discard()
 		s.SetStore(checkStore)
@@ -330,6 +353,19 @@ func (s *StateMachine) ApplyTransactions(ctx context.Context, txs [][]byte, r *l
 		// check if the transaction is a 'same block' duplicate
 		if found := deDuplicator.Found(hashString); found {
 			return lib.ErrDuplicateTx(hashString)
+		}
+		// reject alternate valid signature envelopes for the same multisig intent
+		if intentID := multisigIntentIDs[i]; len(intentID) != 0 {
+			var intentKey [crypto.HashSize]byte
+			copy(intentKey[:], intentID)
+			if found := multisigIntentDeDuplicator.Found(intentKey); found {
+				duplicateErr := lib.ErrDuplicateTx(lib.BytesToString(intentID))
+				if allowOversize {
+					r.AddFailed(lib.NewFailedTx(tx, duplicateErr))
+					continue
+				}
+				return duplicateErr
+			}
 		}
 		// get the tx size
 		txSize := uint64(len(tx))
@@ -787,6 +823,27 @@ func (s *StateMachine) Discard()                                      { s.store.
 func (s *StateMachine) ProposalVoteConfig() GovProposalVoteConfig     { return s.proposeVoteConfig }
 func (s *StateMachine) SetProposalVoteConfig(c GovProposalVoteConfig) { s.proposeVoteConfig = c }
 
+// isRestricted() checks if an address is restricted from transacting
+func (s *StateMachine) isRestricted(address []byte) bool {
+	if len(address) != crypto.AddressSize {
+		return false
+	}
+	value := hex.EncodeToString(address)
+	if _, found := lib.RestrictedAddresses[value]; found {
+		return true
+	}
+	// AcceptAllProposals bypasses only node-local restrictions that may vary across validators and affect BFT consensus; the deterministic hardcoded list always applies.
+	if s.proposeVoteConfig == AcceptAllProposals {
+		return false
+	}
+	for _, configured := range s.Config.RestrictedAddresses {
+		if strings.TrimPrefix(strings.ToLower(configured), "0x") == value {
+			return true
+		}
+	}
+	return false
+}
+
 var _ lib.PluginCompatibleFSM = new(StateMachine)
 
 // StateRead() implements the 'state read' interface for plugins
@@ -820,9 +877,9 @@ func (s *StateMachine) StateRead(request *lib.PluginStateReadRequest) (response 
 		}
 		// calculate entries
 		var entries []*lib.PluginStateEntry
-		// allow 0 limit
+		// apply the default range limit
 		if r.Limit == 0 {
-			r.Limit = math.MaxUint64
+			r.Limit = defaultPluginStateReadLimit
 		}
 		// while the iterator is valid and the limit is not reached
 		for i := uint64(0); i < r.Limit && it.Valid(); i++ {
