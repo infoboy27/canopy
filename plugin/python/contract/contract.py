@@ -170,7 +170,10 @@ def key_for_faucet(address: bytes) -> bytes:
     return join_len_prefix(FAUCET_PREFIX, address)
 
 
-TREASURY_ADDRESS = bytes.fromhex("a565c2cc9f4a18a62a2c6a288428850f276c8d0e")  # house treasury: rake destination (owner-controlled)
+TREASURY_ADDRESS = bytes.fromhex("4919006f0f09b382befcc08611052f6d62a5d36e")  # house treasury: rake destination (owner-controlled)
+# Rotated 2026-09-07: the prior treasury key (a565c2cc9f4a18a62a2c6a288428850f276c8d0e)
+# had been pasted in plaintext across chat sessions and is treated as compromised.
+# It still holds a small pre-rotation balance to be swept manually.
 
 # Addresses allowed to mint (faucet/reward/buy_coins/buy_gems). Without this,
 # any signed tx naming itself as signer/admin could mint unlimited coins or
