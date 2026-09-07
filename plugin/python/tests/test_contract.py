@@ -8,7 +8,7 @@ transactions.
 
 import pytest
 
-from contract.contract import Contract
+from contract.contract import Contract, ADMIN_ADDRESSES
 from contract.plugin import Config
 from contract.error import PluginError
 from contract.proto import (
@@ -24,10 +24,12 @@ from contract.proto import (
 # Error codes (see contract/error.py)
 CODE_INVALID_ADDRESS = 12
 CODE_INVALID_AMOUNT = 13
+CODE_UNAUTHORIZED_SIGNER = 15
 
 ADDR_A = b"a" * 20
 ADDR_B = b"b" * 20
 ADDR_SHORT = b"short"
+ADDR_ADMIN = next(iter(ADMIN_ADDRESSES))
 
 
 @pytest.fixture
@@ -89,39 +91,47 @@ class TestCheckMessageSend:
 
 
 class TestCheckMessageFaucet:
-    """Stateless validation of the tutorial 'faucet' message."""
+    """Stateless validation of the 'faucet' message (admin-only mint)."""
 
     def test_valid(self, contract):
-        msg = MessageFaucet(signer_address=ADDR_A, recipient_address=ADDR_B, amount=500)
+        msg = MessageFaucet(signer_address=ADDR_ADMIN, recipient_address=ADDR_B, amount=500)
         result = contract._check_message_faucet(msg)
 
         assert not result.HasField("error")
         assert result.recipient == ADDR_B
-        assert list(result.authorized_signers) == [ADDR_A]
+        assert list(result.authorized_signers) == [ADDR_ADMIN]
 
     def test_invalid_recipient(self, contract):
-        msg = MessageFaucet(signer_address=ADDR_A, recipient_address=ADDR_SHORT, amount=500)
+        msg = MessageFaucet(signer_address=ADDR_ADMIN, recipient_address=ADDR_SHORT, amount=500)
         with pytest.raises(PluginError) as exc:
             contract._check_message_faucet(msg)
         assert exc.value.code == CODE_INVALID_ADDRESS
 
     def test_invalid_amount(self, contract):
-        msg = MessageFaucet(signer_address=ADDR_A, recipient_address=ADDR_B, amount=0)
+        msg = MessageFaucet(signer_address=ADDR_ADMIN, recipient_address=ADDR_B, amount=0)
         with pytest.raises(PluginError) as exc:
             contract._check_message_faucet(msg)
         assert exc.value.code == CODE_INVALID_AMOUNT
 
+    def test_unauthorized_signer_rejected(self, contract):
+        """Regression: any address used to be able to mint via faucet by
+        naming itself as signer — only an ADMIN_ADDRESSES entry may now."""
+        msg = MessageFaucet(signer_address=ADDR_A, recipient_address=ADDR_B, amount=500)
+        with pytest.raises(PluginError) as exc:
+            contract._check_message_faucet(msg)
+        assert exc.value.code == CODE_UNAUTHORIZED_SIGNER
+
 
 class TestCheckMessageReward:
-    """Stateless validation of the tutorial 'reward' message."""
+    """Stateless validation of the 'reward' message (admin-authorised mint)."""
 
     def test_valid(self, contract):
-        msg = MessageReward(admin_address=ADDR_A, recipient_address=ADDR_B, amount=750)
+        msg = MessageReward(admin_address=ADDR_ADMIN, recipient_address=ADDR_B, amount=750)
         result = contract._check_message_reward(msg)
 
         assert not result.HasField("error")
         assert result.recipient == ADDR_B
-        assert list(result.authorized_signers) == [ADDR_A]
+        assert list(result.authorized_signers) == [ADDR_ADMIN]
 
     def test_invalid_admin(self, contract):
         msg = MessageReward(admin_address=ADDR_SHORT, recipient_address=ADDR_B, amount=750)
@@ -130,10 +140,36 @@ class TestCheckMessageReward:
         assert exc.value.code == CODE_INVALID_ADDRESS
 
     def test_invalid_amount(self, contract):
-        msg = MessageReward(admin_address=ADDR_A, recipient_address=ADDR_B, amount=0)
+        msg = MessageReward(admin_address=ADDR_ADMIN, recipient_address=ADDR_B, amount=0)
         with pytest.raises(PluginError) as exc:
             contract._check_message_reward(msg)
         assert exc.value.code == CODE_INVALID_AMOUNT
+
+    def test_unauthorized_signer_rejected(self, contract):
+        """Regression: any address used to be able to mint via reward by
+        naming itself as admin_address — only an ADMIN_ADDRESSES entry may now."""
+        msg = MessageReward(admin_address=ADDR_A, recipient_address=ADDR_B, amount=750)
+        with pytest.raises(PluginError) as exc:
+            contract._check_message_reward(msg)
+        assert exc.value.code == CODE_UNAUTHORIZED_SIGNER
+
+
+class TestCheckMintLike:
+    """Stateless validation shared by buy_coins/buy_gems — both mint
+    unconditionally to `recipient`, so `admin` must be authorized."""
+
+    def test_valid(self, contract):
+        result = contract._check_mint_like(ADDR_ADMIN, ADDR_B, 1_000)
+        assert not result.HasField("error")
+        assert result.recipient == ADDR_B
+        assert list(result.authorized_signers) == [ADDR_ADMIN]
+
+    def test_unauthorized_signer_rejected(self, contract):
+        """Regression: buy_coins/buy_gems had the exact same unauthenticated-
+        mint bug as faucet — anyone naming themselves as admin could mint."""
+        with pytest.raises(PluginError) as exc:
+            contract._check_mint_like(ADDR_A, ADDR_B, 1_000)
+        assert exc.value.code == CODE_UNAUTHORIZED_SIGNER
 
 
 @pytest.mark.asyncio

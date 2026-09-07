@@ -69,6 +69,7 @@ from .error import (
     err_insufficient_funds,
     err_tx_fee_below_state_limit,
     err_invalid_message_cast,
+    err_unauthorized_signer,
     err_unmarshal,
 )
 
@@ -161,6 +162,15 @@ def key_for_faucet(address: bytes) -> bytes:
 
 
 TREASURY_ADDRESS = bytes.fromhex("a565c2cc9f4a18a62a2c6a288428850f276c8d0e")  # house treasury: rake destination (owner-controlled)
+
+# Addresses allowed to mint (faucet/reward/buy_coins/buy_gems). Without this,
+# any signed tx naming itself as signer/admin could mint unlimited coins or
+# gems to any recipient — none of these messages carry any other proof of
+# privilege. Single-operator model for now, same as room settlement; move to
+# on-chain governance (multisig/DAO) before this chain holds real value.
+ADMIN_ADDRESSES = frozenset({
+    bytes.fromhex("fb70ee0f20168be6d3a98f13dcbab09b1ea18c65"),  # casino-gameserver operator key
+})
 
 
 def key_for_reward(address: bytes) -> bytes:
@@ -540,13 +550,15 @@ class Contract:
     # ── faucet / reward (Phase 0 tutorial validation) ────────────────────────
 
     def _check_message_faucet(self, msg: MessageFaucet) -> PluginCheckResponse:
-        """Statelessly validate a 'faucet' message (test-only mint, no balance check)."""
+        """Statelessly validate a 'faucet' message (admin-only mint, no balance check)."""
         if len(msg.signer_address) != 20:
             raise err_invalid_address()
         if len(msg.recipient_address) != 20:
             raise err_invalid_address()
         if msg.amount == 0:
             raise err_invalid_amount()
+        if msg.signer_address not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
         response = PluginCheckResponse()
         response.recipient = msg.recipient_address
         response.authorized_signers.append(msg.signer_address)
@@ -560,6 +572,8 @@ class Contract:
             raise err_invalid_address()
         if msg.amount == 0:
             raise err_invalid_amount()
+        if msg.admin_address not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
         response = PluginCheckResponse()
         response.recipient = msg.recipient_address
         response.authorized_signers.append(msg.admin_address)
@@ -891,10 +905,14 @@ class Contract:
     # ── economy: coins/gems ───────────────────────────────────────────────────
 
     def _check_mint_like(self, admin, recipient, amount):
+        """Shared check for buy_coins/buy_gems — both mint unconditionally to
+        `recipient` with no balance debit, so `admin` must be a real admin."""
         if len(admin) != 20 or len(recipient) != 20:
             raise err_invalid_address()
         if amount == 0:
             raise err_invalid_amount()
+        if admin not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
         r = PluginCheckResponse()
         r.recipient = recipient
         r.authorized_signers.append(admin)
