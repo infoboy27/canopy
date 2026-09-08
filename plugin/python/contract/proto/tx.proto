@@ -345,3 +345,71 @@ message DominoRound {
   repeated uint32 winner_slots = 11;          // @gotags: json:winnerSlots -- >1 entry only on a tied block
   string result_reason = 12;                 // @gotags: json:resultReason -- emptied_hand | blocked
 }
+
+// -- Poker: heads-up (2-player) No-Limit Texas Hold'em, fixed blinds --
+//
+// Same replay-at-settle trustlessness as Domino, extended further: not just
+// action legality but a full best-of-7 hand evaluation at showdown, and
+// money amounts (bets/raises) instead of simple tile placement. No side
+// pots -- deferred, only matters with 3+ players at different stack sizes.
+
+// MessageOpenPoker opens a round and commits to a hidden seed (commit-reveal).
+message MessageOpenPoker {
+  bytes operator_address = 1; // @gotags: json:operatorAddress
+  bytes round_id = 2;         // @gotags: json:roundID
+  bytes commitment = 3;       // sha256(seed), revealed at settle
+  uint64 small_blind = 4;     // @gotags: json:smallBlind
+  uint64 big_blind = 5;       // @gotags: json:bigBlind
+  uint64 buy_in = 6;          // @gotags: json:buyIn -- each of the 2 players escrows exactly this amount
+  uint64 rake_bps = 7;        // @gotags: json:rakeBps
+}
+
+// MessageJoinPoker escrows one player's buy-in into an open round.
+// Exactly 2 players per round; a 3rd join is rejected.
+message MessageJoinPoker {
+  bytes player_address = 1; // @gotags: json:playerAddress
+  bytes round_id = 2;       // @gotags: json:roundID
+  uint64 amount = 3;
+}
+
+// PokerActionRecord is one action in the claimed betting log submitted at
+// settle. No player field -- whose turn it is is fully determined by the
+// engine itself from the actions that came before, same as Domino's moves.
+message PokerActionRecord {
+  string action = 1; // fold | check_call | bet_raise
+  uint64 amount = 2; // meaningful only for bet_raise -- TOTAL contributed to the current street after this action
+}
+
+// MessageSettlePoker reveals the seed and the full action log; the plugin
+// replays both to derive the winner and pot independently.
+message MessageSettlePoker {
+  bytes operator_address = 1;             // @gotags: json:operatorAddress
+  bytes round_id = 2;                     // @gotags: json:roundID
+  bytes seed = 3;                         // revealed; sha256(seed) must equal the commitment
+  repeated PokerActionRecord actions = 4;
+}
+
+// MessageExpirePoker refunds both buy-ins for a round the operator never
+// settled, once ROOM_EXPIRY_BLOCKS have passed. Callable by anyone.
+message MessageExpirePoker {
+  bytes caller_address = 1; // @gotags: json:callerAddress
+  bytes round_id = 2;       // @gotags: json:roundID
+}
+
+// PokerRound is the on-chain state record for a round.
+message PokerRound {
+  bytes round_id = 1;                        // @gotags: json:roundID
+  bytes operator_address = 2;                // @gotags: json:operatorAddress
+  bytes commitment = 3;
+  uint64 small_blind = 4;                    // @gotags: json:smallBlind
+  uint64 big_blind = 5;                      // @gotags: json:bigBlind
+  uint64 buy_in = 6;                         // @gotags: json:buyIn
+  uint64 rake_bps = 7;                       // @gotags: json:rakeBps
+  uint64 escrow_total = 8;                   // @gotags: json:escrowTotal
+  uint32 status = 9;                         // 0 = open, 1 = settled, 2 = expired (refunded)
+  repeated bytes participant_addresses = 10; // @gotags: json:participantAddresses -- join order: 0=dealer/SB, 1=BB
+  uint64 opened_height = 11;                 // @gotags: json:openedHeight
+  bytes seed = 12;                           // revealed seed, empty until settled
+  repeated uint32 winner_slots = 13;          // @gotags: json:winnerSlots
+  string result_reason = 14;                 // @gotags: json:resultReason -- fold | showdown
+}
