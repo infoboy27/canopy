@@ -65,9 +65,15 @@ from .proto.tx_pb2 import (
     MessageExpireRoulette,
     RouletteRound,
     RouletteBetRecord,
+    MessageOpenDomino,
+    MessageJoinDomino,
+    MessageSettleDomino,
+    MessageExpireDomino,
+    DominoRound,
 )
 from .game import card as gcard, draw as gdraw, rules as grules, economy as gecon
 from .game import roulette as groulette
+from .game import domino as gdomino
 from .game.rng import derive_seed, commitment as seed_commitment
 
 from .error import (
@@ -94,7 +100,7 @@ CONTRACT_CONFIG = {
     "name": "python_plugin_contract",
     "id": 1,
     "version": 1,
-    "supported_transactions": ["send", "faucet", "reward", "open_room", "join_room", "settle_room", "expire_room", "buy_coins", "buy_gems", "transfer_gems", "mint_cosmetic", "buy_cosmetic", "transfer_cosmetic", "open_roulette", "roulette_bet", "settle_roulette", "expire_roulette"],
+    "supported_transactions": ["send", "faucet", "reward", "open_room", "join_room", "settle_room", "expire_room", "buy_coins", "buy_gems", "transfer_gems", "mint_cosmetic", "buy_cosmetic", "transfer_cosmetic", "open_roulette", "roulette_bet", "settle_roulette", "expire_roulette", "open_domino", "join_domino", "settle_domino", "expire_domino"],
     "transaction_type_urls": [
         "type.googleapis.com/types.MessageSend",
         "type.googleapis.com/types.MessageFaucet",
@@ -113,9 +119,13 @@ CONTRACT_CONFIG = {
         "type.googleapis.com/types.MessageRouletteBet",
         "type.googleapis.com/types.MessageSettleRoulette",
         "type.googleapis.com/types.MessageExpireRoulette",
+        "type.googleapis.com/types.MessageOpenDomino",
+        "type.googleapis.com/types.MessageJoinDomino",
+        "type.googleapis.com/types.MessageSettleDomino",
+        "type.googleapis.com/types.MessageExpireDomino",
     ],
     "event_type_urls": [],
-    "custom_state_prefixes": [b"\x64", b"\x65", b"\x6e", b"\x6f", b"\x70", b"\x71", b"\x72", b"\x73"],  # +112 gems,113 cosmetic,114/115 roulette
+    "custom_state_prefixes": [b"\x64", b"\x65", b"\x6e", b"\x6f", b"\x70", b"\x71", b"\x72", b"\x73", b"\x74"],  # +112 gems,113 cosmetic,114/115 roulette,116 domino
     # Include google/protobuf/any.proto first as it's a dependency of event.proto and tx.proto
     "file_descriptor_protos": [
         any_pb2.DESCRIPTOR.serialized_pb,
@@ -279,6 +289,23 @@ def roulette_escrow_address(round_id: bytes) -> bytes:
     return hashlib.sha256(b"roulette-escrow" + bytes(round_id)).digest()[:20]
 
 
+DOMINO_ROUND_PREFIX = b"\x74"  # 116
+
+
+def key_for_domino_round(round_id: bytes) -> bytes:
+    """State key for a domino round record. No separate per-participant
+    record like Bingo's -- capped at exactly 2 players, both addresses live
+    directly on DominoRound.participant_addresses."""
+    return join_len_prefix(DOMINO_ROUND_PREFIX, round_id)
+
+
+def domino_escrow_address(round_id: bytes) -> bytes:
+    """Deterministic 20-byte account address holding a domino round's escrow.
+    Distinct salt so it never collides with Bingo's or Roulette's escrow for
+    the same round_id."""
+    return hashlib.sha256(b"domino-escrow" + bytes(round_id)).digest()[:20]
+
+
 class Contract:
     """
     Contract defines the smart contract that implements the extended logic of the nested chain.
@@ -397,6 +424,18 @@ class Contract:
             elif type_url.endswith("/types.MessageExpireRoulette"):
                 msg = MessageExpireRoulette(); msg.ParseFromString(request.tx.msg.value)
                 return self._check_message_expire_roulette(msg)
+            elif type_url.endswith("/types.MessageOpenDomino"):
+                msg = MessageOpenDomino(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_open_domino(msg)
+            elif type_url.endswith("/types.MessageJoinDomino"):
+                msg = MessageJoinDomino(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_join_domino(msg)
+            elif type_url.endswith("/types.MessageSettleDomino"):
+                msg = MessageSettleDomino(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_settle_domino(msg)
+            elif type_url.endswith("/types.MessageExpireDomino"):
+                msg = MessageExpireDomino(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_expire_domino(msg)
             else:
                 raise err_invalid_message_cast()
 
@@ -476,6 +515,18 @@ class Contract:
             elif type_url.endswith("/types.MessageExpireRoulette"):
                 msg = MessageExpireRoulette(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_expire_roulette(msg, request.height)
+            elif type_url.endswith("/types.MessageOpenDomino"):
+                msg = MessageOpenDomino(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_message_open_domino(msg, request.height)
+            elif type_url.endswith("/types.MessageJoinDomino"):
+                msg = MessageJoinDomino(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_message_join_domino(msg)
+            elif type_url.endswith("/types.MessageSettleDomino"):
+                msg = MessageSettleDomino(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_message_settle_domino(msg)
+            elif type_url.endswith("/types.MessageExpireDomino"):
+                msg = MessageExpireDomino(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_message_expire_domino(msg, request.height)
             else:
                 raise err_invalid_message_cast()
 
@@ -1347,6 +1398,283 @@ class Contract:
             acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
             acct.amount += amount
             total_refunded += amount
+            sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
+
+        if escrow.amount < total_refunded:
+            raise PluginError(1, "plugin", "escrow underfunded")
+        escrow.amount -= total_refunded
+        sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
+        rr.status = 2  # expired/refunded
+        sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
+
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=sets))
+        out = PluginDeliverResponse()
+        if w.HasField("error"):
+            out.error.CopyFrom(w.error)
+        return out
+
+    # ── Domino round escrow (heads-up, commit-reveal deal + replayed moves) ──
+
+    def _check_message_open_domino(self, msg) -> PluginCheckResponse:
+        if len(msg.operator_address) != 20:
+            raise err_invalid_address()
+        if not msg.round_id:
+            raise PluginError(1, "plugin", "empty round_id")
+        if len(msg.commitment) != 32:
+            raise PluginError(1, "plugin", "commitment must be 32 bytes")
+        if msg.entry_fee == 0:
+            raise err_invalid_amount()
+        if msg.rake_bps > 10000:
+            raise PluginError(1, "plugin", "rake_bps must be <= 10000")
+        if msg.operator_address not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
+        r = PluginCheckResponse()
+        r.authorized_signers.append(msg.operator_address)
+        return r
+
+    def _check_message_join_domino(self, msg) -> PluginCheckResponse:
+        if len(msg.player_address) != 20:
+            raise err_invalid_address()
+        if not msg.round_id:
+            raise PluginError(1, "plugin", "empty round_id")
+        if msg.amount == 0:
+            raise err_invalid_amount()
+        r = PluginCheckResponse()
+        r.authorized_signers.append(msg.player_address)
+        return r
+
+    def _check_message_settle_domino(self, msg) -> PluginCheckResponse:
+        if len(msg.operator_address) != 20:
+            raise err_invalid_address()
+        if not msg.round_id:
+            raise PluginError(1, "plugin", "empty round_id")
+        if not msg.seed:
+            raise PluginError(1, "plugin", "empty seed")
+        if not msg.moves:
+            raise PluginError(1, "plugin", "empty move log")
+        r = PluginCheckResponse()
+        r.authorized_signers.append(msg.operator_address)
+        return r
+
+    def _check_message_expire_domino(self, msg) -> PluginCheckResponse:
+        """Statelessly validate an 'expire_domino' message. Anyone may call
+        this -- the deliver step enforces the round exists, is still open,
+        and has passed its deadline."""
+        if len(msg.caller_address) != 20:
+            raise err_invalid_address()
+        if not msg.round_id:
+            raise PluginError(1, "plugin", "empty round_id")
+        r = PluginCheckResponse()
+        r.authorized_signers.append(msg.caller_address)
+        return r
+
+    async def _deliver_message_open_domino(self, msg, height: int = 0) -> PluginDeliverResponse:
+        if not self.plugin or not self.config:
+            raise PluginError(1, "plugin", "plugin or config not initialized")
+        round_key = key_for_domino_round(msg.round_id)
+        val, err = await self._read_one(round_key)
+        if err:
+            out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
+        if val:
+            raise PluginError(1, "plugin", "round already exists")
+        rr = DominoRound()
+        rr.round_id = msg.round_id
+        rr.operator_address = msg.operator_address
+        rr.commitment = msg.commitment
+        rr.entry_fee = msg.entry_fee
+        rr.rake_bps = msg.rake_bps
+        rr.escrow_total = 0
+        rr.status = 0
+        rr.opened_height = height
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(
+            sets=[PluginSetOp(key=round_key, value=marshal(rr))]))
+        out = PluginDeliverResponse()
+        if w.HasField("error"):
+            out.error.CopyFrom(w.error)
+        return out
+
+    async def _deliver_message_join_domino(self, msg) -> PluginDeliverResponse:
+        if not self.plugin or not self.config:
+            raise PluginError(1, "plugin", "plugin or config not initialized")
+        round_key = key_for_domino_round(msg.round_id)
+        player_key = key_for_account(msg.player_address)
+        escrow_key = key_for_account(domino_escrow_address(msg.round_id))
+        qr, qpl, qe = (random.randint(0, 2**53) for _ in range(3))
+        resp = await self.plugin.state_read(self, PluginStateReadRequest(keys=[
+            PluginKeyRead(query_id=qr, key=round_key),
+            PluginKeyRead(query_id=qpl, key=player_key),
+            PluginKeyRead(query_id=qe, key=escrow_key),
+        ]))
+        if resp.HasField("error"):
+            out = PluginDeliverResponse(); out.error.CopyFrom(resp.error); return out
+        rb = plb = eb = None
+        for r in resp.results:
+            if r.query_id == qr:
+                rb = r.entries[0].value if r.entries else None
+            elif r.query_id == qpl:
+                plb = r.entries[0].value if r.entries else None
+            elif r.query_id == qe:
+                eb = r.entries[0].value if r.entries else None
+        rr = unmarshal(DominoRound, rb) if rb else None
+        if rr is None:
+            raise PluginError(1, "plugin", "round not found")
+        if rr.status != 0:
+            raise PluginError(1, "plugin", "round not open")
+        if len(rr.participant_addresses) >= gdomino.NUM_PLAYERS:
+            raise PluginError(1, "plugin", "round already has enough players")
+        if bytes(msg.player_address) in [bytes(a) for a in rr.participant_addresses]:
+            raise PluginError(1, "plugin", "address already joined")
+        if msg.amount != rr.entry_fee:
+            raise PluginError(1, "plugin", "amount must equal the round's entry fee")
+        player = unmarshal(Account, plb) if plb else Account()
+        escrow = unmarshal(Account, eb) if eb else Account()
+        if player.amount < msg.amount:
+            raise err_insufficient_funds()
+        player.amount -= msg.amount
+        escrow.amount += msg.amount
+        rr.escrow_total += msg.amount
+        rr.participant_addresses.append(msg.player_address)
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=[
+            PluginSetOp(key=player_key, value=marshal(player)),
+            PluginSetOp(key=escrow_key, value=marshal(escrow)),
+            PluginSetOp(key=round_key, value=marshal(rr)),
+        ]))
+        out = PluginDeliverResponse()
+        if w.HasField("error"):
+            out.error.CopyFrom(w.error)
+        return out
+
+    async def _deliver_message_settle_domino(self, msg) -> PluginDeliverResponse:
+        """Trustless settle: operator reveals the seed AND the full move log.
+        The plugin replays both (deal derived from the seed, each move
+        validated legal in sequence) to derive the winner itself -- exactly
+        like Bingo/Roulette recompute their outcome from the seed, extended
+        here to also validate the moves since domino's outcome depends on
+        player choices, not just the seed. An illegal move anywhere in the
+        claimed log rejects the whole settle -- there is no partial credit."""
+        if not self.plugin or not self.config:
+            raise PluginError(1, "plugin", "plugin or config not initialized")
+        round_key = key_for_domino_round(msg.round_id)
+        val, err = await self._read_one(round_key)
+        if err:
+            out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
+        rr = unmarshal(DominoRound, val) if val else None
+        if rr is None:
+            raise PluginError(1, "plugin", "round not found")
+        if rr.status != 0:
+            raise PluginError(1, "plugin", "round already settled")
+        if bytes(rr.operator_address) != bytes(msg.operator_address):
+            raise PluginError(1, "plugin", "only the operator can settle")
+        if seed_commitment(bytes(msg.seed)) != bytes(rr.commitment):
+            raise PluginError(1, "plugin", "seed does not match commitment")
+        if len(rr.participant_addresses) != gdomino.NUM_PLAYERS:
+            raise PluginError(1, "plugin", "round never filled both seats")
+
+        moves = [
+            gdomino.Move(action=m.action,
+                         tile=(m.tile_low, m.tile_high) if m.action == "play" else None,
+                         end=m.end or None)
+            for m in msg.moves
+        ]
+        try:
+            result = gdomino.replay(bytes(msg.seed), moves)
+        except gdomino.IllegalMove as exc:
+            raise PluginError(1, "plugin", f"illegal move in claimed log: {exc}")
+
+        participants = [bytes(a) for a in rr.participant_addresses]
+        winners = [participants[i] for i in result.winners]
+
+        total = rr.escrow_total
+        rake = total * rr.rake_bps // 10000
+        net = total - rake
+        per_winner = net // len(winners)
+        payouts = [per_winner] * len(winners)
+        payouts[0] += net - sum(payouts)  # remainder to the first winner
+
+        escrow_key = key_for_account(domino_escrow_address(msg.round_id))
+        treasury_key = key_for_account(TREASURY_ADDRESS)
+        qe = random.randint(0, 2**53)
+        qf = random.randint(0, 2**53)
+        keys = [PluginKeyRead(query_id=qe, key=escrow_key),
+                PluginKeyRead(query_id=qf, key=treasury_key)]
+        winner_qids = []
+        for addr in winners:
+            q = random.randint(0, 2**53)
+            winner_qids.append((q, addr))
+            keys.append(PluginKeyRead(query_id=q, key=key_for_account(addr)))
+        resp = await self.plugin.state_read(self, PluginStateReadRequest(keys=keys))
+        if resp.HasField("error"):
+            out = PluginDeliverResponse(); out.error.CopyFrom(resp.error); return out
+        by_qid = {}
+        for r in resp.results:
+            by_qid[r.query_id] = r.entries[0].value if r.entries else None
+        escrow = unmarshal(Account, by_qid.get(qe)) if by_qid.get(qe) else Account()
+        treasury = unmarshal(Account, by_qid.get(qf)) if by_qid.get(qf) else Account()
+        if escrow.amount < total:
+            raise PluginError(1, "plugin", "escrow underfunded")
+        escrow.amount -= total
+        treasury.amount += rake
+        sets = [PluginSetOp(key=escrow_key, value=marshal(escrow)),
+                PluginSetOp(key=treasury_key, value=marshal(treasury))]
+        for i, (q, addr) in enumerate(winner_qids):
+            acct = unmarshal(Account, by_qid.get(q)) if by_qid.get(q) else Account()
+            acct.amount += payouts[i]
+            sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
+
+        rr.status = 1
+        rr.seed = msg.seed
+        rr.winner_slots.extend(result.winners)
+        rr.result_reason = result.reason
+        sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
+
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=sets))
+        out = PluginDeliverResponse()
+        if w.HasField("error"):
+            out.error.CopyFrom(w.error)
+        return out
+
+    async def _deliver_message_expire_domino(self, msg, height: int = 0) -> PluginDeliverResponse:
+        """Refund every escrowed entry fee for a round the operator never
+        settled within ROOM_EXPIRY_BLOCKS -- including a round that only ever
+        got one participant (that one address is simply refunded alone)."""
+        if not self.plugin or not self.config:
+            raise PluginError(1, "plugin", "plugin or config not initialized")
+        round_key = key_for_domino_round(msg.round_id)
+        val, err = await self._read_one(round_key)
+        if err:
+            out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
+        rr = unmarshal(DominoRound, val) if val else None
+        if rr is None:
+            raise PluginError(1, "plugin", "round not found")
+        if rr.status != 0:
+            raise PluginError(1, "plugin", "round is not open")
+        if height < rr.opened_height + ROOM_EXPIRY_BLOCKS:
+            raise err_room_not_expired()
+
+        participants = [bytes(a) for a in rr.participant_addresses]
+        escrow_key = key_for_account(domino_escrow_address(msg.round_id))
+        qe = random.randint(0, 2**53)
+        keys = [PluginKeyRead(query_id=qe, key=escrow_key)]
+        acct_qids = {}
+        for addr in participants:
+            aq = random.randint(0, 2**53)
+            acct_qids[addr] = aq
+            keys.append(PluginKeyRead(query_id=aq, key=key_for_account(addr)))
+        resp = await self.plugin.state_read(self, PluginStateReadRequest(keys=keys))
+        if resp.HasField("error"):
+            out = PluginDeliverResponse(); out.error.CopyFrom(resp.error); return out
+        by_qid = {}
+        for r in resp.results:
+            by_qid[r.query_id] = r.entries[0].value if r.entries else None
+        escrow = unmarshal(Account, by_qid.get(qe)) if by_qid.get(qe) else Account()
+
+        sets = []
+        total_refunded = 0
+        for addr in participants:
+            acct_bytes = by_qid.get(acct_qids[addr])
+            acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
+            acct.amount += rr.entry_fee
+            total_refunded += rr.entry_fee
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
 
         if escrow.amount < total_refunded:
