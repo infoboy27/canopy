@@ -221,3 +221,61 @@ message Cosmetic {
   string kind = 2;
   bytes owner_address = 3; // @gotags: json:"ownerAddress"
 }
+
+// -- Roulette: single-round commit/reveal betting, same escrow shape as Bingo rooms --
+
+// MessageOpenRoulette opens a round and commits to a hidden seed (commit-reveal).
+message MessageOpenRoulette {
+  bytes operator_address = 1; // @gotags: json:"operatorAddress"
+  bytes round_id = 2;         // @gotags: json:"roundID"
+  bytes commitment = 3;       // sha256(seed), revealed at settle
+  uint64 rake_bps = 4;        // @gotags: json:"rakeBps"
+}
+
+// MessageRouletteBet escrows one bet into an open round. One bet per address
+// per round in v1 -- a second bet from the same address is rejected, not
+// merged, so payout accounting stays a simple per-address lookup.
+message MessageRouletteBet {
+  bytes player_address = 1; // @gotags: json:"playerAddress"
+  bytes round_id = 2;       // @gotags: json:"roundID"
+  string bet_type = 3;      // @gotags: json:"betType" -- straight|red|black|odd|even|low|high|dozen1..3|col1..3
+  uint64 bet_number = 4;    // @gotags: json:"betNumber" -- only meaningful for "straight" (0-36)
+  uint64 amount = 5;        // coins escrowed (uCNPY)
+}
+
+// MessageSettleRoulette reveals the seed; the plugin derives the spin and pays every winner.
+message MessageSettleRoulette {
+  bytes operator_address = 1; // @gotags: json:"operatorAddress"
+  bytes round_id = 2;         // @gotags: json:"roundID"
+  bytes seed = 3;             // revealed; sha256(seed) must equal the commitment
+}
+
+// MessageExpireRoulette refunds every bet for a round the operator never
+// settled, once ROOM_EXPIRY_BLOCKS have passed. Callable by anyone.
+message MessageExpireRoulette {
+  bytes caller_address = 1; // @gotags: json:"callerAddress"
+  bytes round_id = 2;       // @gotags: json:"roundID"
+}
+
+// RouletteRound is the on-chain state record for a round.
+message RouletteRound {
+  bytes round_id = 1;         // @gotags: json:"roundID"
+  bytes operator_address = 2; // @gotags: json:"operatorAddress"
+  bytes commitment = 3;
+  uint64 rake_bps = 4;        // @gotags: json:"rakeBps"
+  uint64 pot_total = 5;       // @gotags: json:"potTotal"
+  uint32 status = 6;          // 0 = open, 1 = settled, 2 = expired (refunded)
+  repeated bytes bettor_addresses = 7; // @gotags: json:"bettorAddresses"
+  uint64 opened_height = 8;   // @gotags: json:"openedHeight"
+  bytes seed = 9;             // revealed seed, empty until settled
+  uint32 spin = 10;           // winning number 0-36, only meaningful once settled
+}
+
+// RouletteBetRecord records one player's escrowed bet in a round.
+message RouletteBetRecord {
+  bytes round_id = 1;       // @gotags: json:"roundID"
+  bytes player_address = 2; // @gotags: json:"playerAddress"
+  string bet_type = 3;      // @gotags: json:"betType"
+  uint64 bet_number = 4;    // @gotags: json:"betNumber"
+  uint64 amount = 5;
+}

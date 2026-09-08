@@ -59,8 +59,15 @@ from .proto.tx_pb2 import (
     MessageTransferCosmetic,
     GemBalance,
     Cosmetic,
+    MessageOpenRoulette,
+    MessageRouletteBet,
+    MessageSettleRoulette,
+    MessageExpireRoulette,
+    RouletteRound,
+    RouletteBetRecord,
 )
 from .game import card as gcard, draw as gdraw, rules as grules, economy as gecon
+from .game import roulette as groulette
 from .game.rng import derive_seed, commitment as seed_commitment
 
 from .error import (
@@ -87,7 +94,7 @@ CONTRACT_CONFIG = {
     "name": "python_plugin_contract",
     "id": 1,
     "version": 1,
-    "supported_transactions": ["send", "faucet", "reward", "open_room", "join_room", "settle_room", "expire_room", "buy_coins", "buy_gems", "transfer_gems", "mint_cosmetic", "buy_cosmetic", "transfer_cosmetic"],
+    "supported_transactions": ["send", "faucet", "reward", "open_room", "join_room", "settle_room", "expire_room", "buy_coins", "buy_gems", "transfer_gems", "mint_cosmetic", "buy_cosmetic", "transfer_cosmetic", "open_roulette", "roulette_bet", "settle_roulette", "expire_roulette"],
     "transaction_type_urls": [
         "type.googleapis.com/types.MessageSend",
         "type.googleapis.com/types.MessageFaucet",
@@ -102,9 +109,13 @@ CONTRACT_CONFIG = {
         "type.googleapis.com/types.MessageMintCosmetic",
         "type.googleapis.com/types.MessageBuyCosmetic",
         "type.googleapis.com/types.MessageTransferCosmetic",
+        "type.googleapis.com/types.MessageOpenRoulette",
+        "type.googleapis.com/types.MessageRouletteBet",
+        "type.googleapis.com/types.MessageSettleRoulette",
+        "type.googleapis.com/types.MessageExpireRoulette",
     ],
     "event_type_urls": [],
-    "custom_state_prefixes": [b"\x64", b"\x65", b"\x6e", b"\x6f", b"\x70", b"\x71"],  # +112 gems,113 cosmetic
+    "custom_state_prefixes": [b"\x64", b"\x65", b"\x6e", b"\x6f", b"\x70", b"\x71", b"\x72", b"\x73"],  # +112 gems,113 cosmetic,114/115 roulette
     # Include google/protobuf/any.proto first as it's a dependency of event.proto and tx.proto
     "file_descriptor_protos": [
         any_pb2.DESCRIPTOR.serialized_pb,
@@ -247,6 +258,27 @@ def key_for_cosmetic(token_id: bytes) -> bytes:
     return join_len_prefix(COSMETIC_PREFIX, token_id)
 
 
+ROULETTE_ROUND_PREFIX = b"\x72"  # 114
+ROULETTE_BET_PREFIX = b"\x73"    # 115
+
+
+def key_for_roulette_round(round_id: bytes) -> bytes:
+    """State key for a roulette round record."""
+    return join_len_prefix(ROULETTE_ROUND_PREFIX, round_id)
+
+
+def key_for_roulette_bet(round_id: bytes, address: bytes) -> bytes:
+    """State key for one address's bet in a roulette round."""
+    return join_len_prefix(ROULETTE_BET_PREFIX, round_id, address)
+
+
+def roulette_escrow_address(round_id: bytes) -> bytes:
+    """Deterministic 20-byte account address holding a roulette round's escrow.
+    Distinct salt from Bingo's escrow_address() so the two games never collide
+    on the same round_id."""
+    return hashlib.sha256(b"roulette-escrow" + bytes(round_id)).digest()[:20]
+
+
 class Contract:
     """
     Contract defines the smart contract that implements the extended logic of the nested chain.
@@ -353,6 +385,18 @@ class Contract:
             elif type_url.endswith("/types.MessageTransferCosmetic"):
                 msg = MessageTransferCosmetic(); msg.ParseFromString(request.tx.msg.value)
                 return self._check_transfer_cosmetic(msg)
+            elif type_url.endswith("/types.MessageOpenRoulette"):
+                msg = MessageOpenRoulette(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_open_roulette(msg)
+            elif type_url.endswith("/types.MessageRouletteBet"):
+                msg = MessageRouletteBet(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_roulette_bet(msg)
+            elif type_url.endswith("/types.MessageSettleRoulette"):
+                msg = MessageSettleRoulette(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_settle_roulette(msg)
+            elif type_url.endswith("/types.MessageExpireRoulette"):
+                msg = MessageExpireRoulette(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_expire_roulette(msg)
             else:
                 raise err_invalid_message_cast()
 
@@ -420,6 +464,18 @@ class Contract:
             elif type_url.endswith("/types.MessageTransferCosmetic"):
                 msg = MessageTransferCosmetic(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_transfer_cosmetic(msg)
+            elif type_url.endswith("/types.MessageOpenRoulette"):
+                msg = MessageOpenRoulette(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_message_open_roulette(msg, request.height)
+            elif type_url.endswith("/types.MessageRouletteBet"):
+                msg = MessageRouletteBet(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_message_roulette_bet(msg)
+            elif type_url.endswith("/types.MessageSettleRoulette"):
+                msg = MessageSettleRoulette(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_message_settle_roulette(msg)
+            elif type_url.endswith("/types.MessageExpireRoulette"):
+                msg = MessageExpireRoulette(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_message_expire_roulette(msg, request.height)
             else:
                 raise err_invalid_message_cast()
 
@@ -995,6 +1051,311 @@ class Contract:
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
         rr.status = 1
         sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=sets))
+        out = PluginDeliverResponse()
+        if w.HasField("error"):
+            out.error.CopyFrom(w.error)
+        return out
+
+    # ── Roulette round escrow (commit / reveal, single wheel per round) ──────
+
+    def _check_message_open_roulette(self, msg) -> PluginCheckResponse:
+        if len(msg.operator_address) != 20:
+            raise err_invalid_address()
+        if not msg.round_id:
+            raise PluginError(1, "plugin", "empty round_id")
+        if len(msg.commitment) != 32:
+            raise PluginError(1, "plugin", "commitment must be 32 bytes")
+        if msg.rake_bps > 10000:
+            raise PluginError(1, "plugin", "rake_bps must be <= 10000")
+        # Unlike open_room, this is gated to admins from day one -- open_room's
+        # unrestricted operator field is a known gap (any address can claim to
+        # "operate" a room), not something to carry into a new message type.
+        if msg.operator_address not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
+        r = PluginCheckResponse()
+        r.authorized_signers.append(msg.operator_address)
+        return r
+
+    def _check_message_roulette_bet(self, msg) -> PluginCheckResponse:
+        if len(msg.player_address) != 20:
+            raise err_invalid_address()
+        if not msg.round_id:
+            raise PluginError(1, "plugin", "empty round_id")
+        if msg.amount == 0:
+            raise err_invalid_amount()
+        if not groulette.is_valid_bet(msg.bet_type, msg.bet_number):
+            raise PluginError(1, "plugin", "invalid bet_type/bet_number")
+        r = PluginCheckResponse()
+        r.authorized_signers.append(msg.player_address)
+        return r
+
+    def _check_message_settle_roulette(self, msg) -> PluginCheckResponse:
+        if len(msg.operator_address) != 20:
+            raise err_invalid_address()
+        if not msg.round_id:
+            raise PluginError(1, "plugin", "empty round_id")
+        if not msg.seed:
+            raise PluginError(1, "plugin", "empty seed")
+        r = PluginCheckResponse()
+        r.authorized_signers.append(msg.operator_address)
+        return r
+
+    def _check_message_expire_roulette(self, msg) -> PluginCheckResponse:
+        """Statelessly validate an 'expire_roulette' message. Anyone may call
+        this -- the deliver step enforces the round exists, is still open, and
+        has passed its deadline."""
+        if len(msg.caller_address) != 20:
+            raise err_invalid_address()
+        if not msg.round_id:
+            raise PluginError(1, "plugin", "empty round_id")
+        r = PluginCheckResponse()
+        r.authorized_signers.append(msg.caller_address)
+        return r
+
+    async def _deliver_message_open_roulette(self, msg, height: int = 0) -> PluginDeliverResponse:
+        if not self.plugin or not self.config:
+            raise PluginError(1, "plugin", "plugin or config not initialized")
+        round_key = key_for_roulette_round(msg.round_id)
+        val, err = await self._read_one(round_key)
+        if err:
+            out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
+        if val:
+            raise PluginError(1, "plugin", "round already exists")
+        rr = RouletteRound()
+        rr.round_id = msg.round_id
+        rr.operator_address = msg.operator_address
+        rr.commitment = msg.commitment
+        rr.rake_bps = msg.rake_bps
+        rr.pot_total = 0
+        rr.status = 0
+        rr.opened_height = height
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(
+            sets=[PluginSetOp(key=round_key, value=marshal(rr))]))
+        out = PluginDeliverResponse()
+        if w.HasField("error"):
+            out.error.CopyFrom(w.error)
+        return out
+
+    async def _deliver_message_roulette_bet(self, msg) -> PluginDeliverResponse:
+        if not self.plugin or not self.config:
+            raise PluginError(1, "plugin", "plugin or config not initialized")
+        round_key = key_for_roulette_round(msg.round_id)
+        bet_key = key_for_roulette_bet(msg.round_id, msg.player_address)
+        player_key = key_for_account(msg.player_address)
+        escrow_key = key_for_account(roulette_escrow_address(msg.round_id))
+        qr, qb, qpl, qe = (random.randint(0, 2**53) for _ in range(4))
+        resp = await self.plugin.state_read(self, PluginStateReadRequest(keys=[
+            PluginKeyRead(query_id=qr, key=round_key),
+            PluginKeyRead(query_id=qb, key=bet_key),
+            PluginKeyRead(query_id=qpl, key=player_key),
+            PluginKeyRead(query_id=qe, key=escrow_key),
+        ]))
+        if resp.HasField("error"):
+            out = PluginDeliverResponse(); out.error.CopyFrom(resp.error); return out
+        rb = bb = plb = eb = None
+        for r in resp.results:
+            if r.query_id == qr:
+                rb = r.entries[0].value if r.entries else None
+            elif r.query_id == qb:
+                bb = r.entries[0].value if r.entries else None
+            elif r.query_id == qpl:
+                plb = r.entries[0].value if r.entries else None
+            elif r.query_id == qe:
+                eb = r.entries[0].value if r.entries else None
+        rr = unmarshal(RouletteRound, rb) if rb else None
+        if rr is None:
+            raise PluginError(1, "plugin", "round not found")
+        if rr.status != 0:
+            raise PluginError(1, "plugin", "round not open")
+        if bb:
+            raise PluginError(1, "plugin", "address already has a bet in this round")
+        player = unmarshal(Account, plb) if plb else Account()
+        escrow = unmarshal(Account, eb) if eb else Account()
+        if player.amount < msg.amount:
+            raise err_insufficient_funds()
+        player.amount -= msg.amount
+        escrow.amount += msg.amount
+        rr.pot_total += msg.amount
+        rr.bettor_addresses.append(msg.player_address)
+        bet = RouletteBetRecord()
+        bet.round_id = msg.round_id
+        bet.player_address = msg.player_address
+        bet.bet_type = msg.bet_type
+        bet.bet_number = msg.bet_number
+        bet.amount = msg.amount
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=[
+            PluginSetOp(key=player_key, value=marshal(player)),
+            PluginSetOp(key=escrow_key, value=marshal(escrow)),
+            PluginSetOp(key=round_key, value=marshal(rr)),
+            PluginSetOp(key=bet_key, value=marshal(bet)),
+        ]))
+        out = PluginDeliverResponse()
+        if w.HasField("error"):
+            out.error.CopyFrom(w.error)
+        return out
+
+    async def _deliver_message_settle_roulette(self, msg) -> PluginDeliverResponse:
+        """Trustless settle: operator only reveals the seed. The plugin
+        recomputes the spin from the seed and pays every bettor whose bet
+        matches -- exactly like Bingo's settle recomputes cards rather than
+        trusting a claimed outcome. Unlike Bingo (where the whole pot is split
+        among ranked winners), each roulette bettor is paid independently off
+        their own bet's odds; whatever the escrow doesn't pay out (losing
+        stakes) plus the rake skimmed off winning payouts both go to the
+        treasury, so escrow always ends a settle at exactly zero."""
+        if not self.plugin or not self.config:
+            raise PluginError(1, "plugin", "plugin or config not initialized")
+        round_key = key_for_roulette_round(msg.round_id)
+        val, err = await self._read_one(round_key)
+        if err:
+            out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
+        rr = unmarshal(RouletteRound, val) if val else None
+        if rr is None:
+            raise PluginError(1, "plugin", "round not found")
+        if rr.status != 0:
+            raise PluginError(1, "plugin", "round already settled")
+        if bytes(rr.operator_address) != bytes(msg.operator_address):
+            raise PluginError(1, "plugin", "only the operator can settle")
+        if seed_commitment(bytes(msg.seed)) != bytes(rr.commitment):
+            raise PluginError(1, "plugin", "seed does not match commitment")
+
+        spin = groulette.spin_number(bytes(msg.seed))
+        bettors = [bytes(a) for a in rr.bettor_addresses]
+
+        escrow_key = key_for_account(roulette_escrow_address(msg.round_id))
+        treasury_key = key_for_account(TREASURY_ADDRESS)
+        qe = random.randint(0, 2**53)
+        qf = random.randint(0, 2**53)
+        keys = [PluginKeyRead(query_id=qe, key=escrow_key),
+                PluginKeyRead(query_id=qf, key=treasury_key)]
+        bet_qids, acct_qids = [], {}
+        for addr in bettors:
+            bq = random.randint(0, 2**53)
+            aq = random.randint(0, 2**53)
+            bet_qids.append((bq, addr))
+            acct_qids[addr] = aq
+            keys.append(PluginKeyRead(query_id=bq, key=key_for_roulette_bet(msg.round_id, addr)))
+            keys.append(PluginKeyRead(query_id=aq, key=key_for_account(addr)))
+        resp = await self.plugin.state_read(self, PluginStateReadRequest(keys=keys))
+        if resp.HasField("error"):
+            out = PluginDeliverResponse(); out.error.CopyFrom(resp.error); return out
+        by_qid = {}
+        for r in resp.results:
+            by_qid[r.query_id] = r.entries[0].value if r.entries else None
+
+        escrow = unmarshal(Account, by_qid.get(qe)) if by_qid.get(qe) else Account()
+        treasury = unmarshal(Account, by_qid.get(qf)) if by_qid.get(qf) else Account()
+
+        sets = []
+        total_gross_to_winners = 0
+        total_rake = 0
+        for bq, addr in bet_qids:
+            bet_bytes = by_qid.get(bq)
+            bet = unmarshal(RouletteBetRecord, bet_bytes) if bet_bytes else None
+            if bet is None:
+                continue
+            gross = groulette.payout_for(bet.bet_type, bet.bet_number, bet.amount, spin)
+            if gross <= 0:
+                continue  # lost -- their stake stays in escrow and becomes house profit below
+            rake = gross * rr.rake_bps // 10000
+            net = gross - rake
+            acct_bytes = by_qid.get(acct_qids[addr])
+            acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
+            acct.amount += net
+            total_gross_to_winners += gross
+            total_rake += rake
+            sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
+
+        # Fixed-odds payouts (a straight-up win pays 36x) routinely exceed what
+        # this one round collected -- unlike Bingo's pari-mutuel split, the
+        # pot can't be assumed to cover its own payouts. The round's escrow
+        # pays first; the treasury (accumulated rake + house_take from every
+        # other round) backstops any shortfall, exactly like a real casino
+        # bankroll. If the treasury itself can't cover it, settle fails safely
+        # rather than paying out from nothing.
+        if escrow.amount >= total_gross_to_winners:
+            house_take = escrow.amount - total_gross_to_winners  # losing stakes -> pure house profit
+            treasury.amount += total_rake + house_take
+        else:
+            shortfall = total_gross_to_winners - escrow.amount
+            if treasury.amount < shortfall:
+                raise PluginError(1, "plugin", "treasury underfunded to cover payout")
+            treasury.amount += total_rake - shortfall
+        escrow.amount = 0
+        sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
+        sets.append(PluginSetOp(key=treasury_key, value=marshal(treasury)))
+
+        rr.status = 1
+        rr.seed = msg.seed
+        rr.spin = spin
+        sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
+
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=sets))
+        out = PluginDeliverResponse()
+        if w.HasField("error"):
+            out.error.CopyFrom(w.error)
+        return out
+
+    async def _deliver_message_expire_roulette(self, msg, height: int = 0) -> PluginDeliverResponse:
+        """Refund every escrowed bet for a round the operator never settled
+        within ROOM_EXPIRY_BLOCKS. Each bettor gets back exactly what their own
+        RouletteBetRecord says they staked -- not a recomputed guess."""
+        if not self.plugin or not self.config:
+            raise PluginError(1, "plugin", "plugin or config not initialized")
+        round_key = key_for_roulette_round(msg.round_id)
+        val, err = await self._read_one(round_key)
+        if err:
+            out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
+        rr = unmarshal(RouletteRound, val) if val else None
+        if rr is None:
+            raise PluginError(1, "plugin", "round not found")
+        if rr.status != 0:
+            raise PluginError(1, "plugin", "round is not open")
+        if height < rr.opened_height + ROOM_EXPIRY_BLOCKS:
+            raise err_room_not_expired()
+
+        bettors = [bytes(a) for a in rr.bettor_addresses]
+        escrow_key = key_for_account(roulette_escrow_address(msg.round_id))
+        qe = random.randint(0, 2**53)
+        keys = [PluginKeyRead(query_id=qe, key=escrow_key)]
+        bet_qids, acct_qids = [], {}
+        for addr in bettors:
+            bq = random.randint(0, 2**53)
+            aq = random.randint(0, 2**53)
+            bet_qids.append((bq, addr))
+            acct_qids[addr] = aq
+            keys.append(PluginKeyRead(query_id=bq, key=key_for_roulette_bet(msg.round_id, addr)))
+            keys.append(PluginKeyRead(query_id=aq, key=key_for_account(addr)))
+        resp = await self.plugin.state_read(self, PluginStateReadRequest(keys=keys))
+        if resp.HasField("error"):
+            out = PluginDeliverResponse(); out.error.CopyFrom(resp.error); return out
+        by_qid = {}
+        for r in resp.results:
+            by_qid[r.query_id] = r.entries[0].value if r.entries else None
+        escrow = unmarshal(Account, by_qid.get(qe)) if by_qid.get(qe) else Account()
+
+        sets = []
+        total_refunded = 0
+        for bq, addr in bet_qids:
+            bet_bytes = by_qid.get(bq)
+            bet = unmarshal(RouletteBetRecord, bet_bytes) if bet_bytes else None
+            amount = bet.amount if bet else 0
+            if amount <= 0:
+                continue
+            acct_bytes = by_qid.get(acct_qids[addr])
+            acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
+            acct.amount += amount
+            total_refunded += amount
+            sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
+
+        if escrow.amount < total_refunded:
+            raise PluginError(1, "plugin", "escrow underfunded")
+        escrow.amount -= total_refunded
+        sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
+        rr.status = 2  # expired/refunded
+        sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
+
         w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=sets))
         out = PluginDeliverResponse()
         if w.HasField("error"):
