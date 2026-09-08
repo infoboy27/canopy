@@ -279,3 +279,69 @@ message RouletteBetRecord {
   uint64 bet_number = 4;    // @gotags: json:"betNumber"
   uint64 amount = 5;
 }
+
+// -- Domino: heads-up (2-player) block variant with boneyard draw --
+//
+// Unlike Bingo/Roulette, the outcome depends on which legal move each player
+// CHOSE, not just the seed -- there's no pure function seed -> winner. So
+// settle carries the full move log alongside the revealed seed; the plugin
+// independently replays the deal AND every move (validated legal at the time
+// it was made) to derive the winner itself. The operator's claim is checked,
+// never trusted.
+
+// MessageOpenDomino opens a round and commits to a hidden seed (commit-reveal).
+message MessageOpenDomino {
+  bytes operator_address = 1; // @gotags: json:operatorAddress
+  bytes round_id = 2;         // @gotags: json:roundID
+  bytes commitment = 3;       // sha256(seed), revealed at settle
+  uint64 entry_fee = 4;       // @gotags: json:entryFee -- each of the 2 players escrows exactly this amount
+  uint64 rake_bps = 5;        // @gotags: json:rakeBps
+}
+
+// MessageJoinDomino escrows one player's entry fee into an open round.
+// Exactly 2 players per round; a 3rd join is rejected.
+message MessageJoinDomino {
+  bytes player_address = 1; // @gotags: json:playerAddress
+  bytes round_id = 2;       // @gotags: json:roundID
+  uint64 amount = 3;
+}
+
+// DominoMoveRecord is one turn in the claimed move log submitted at settle.
+message DominoMoveRecord {
+  string action = 1;    // play | draw | pass
+  uint32 tile_low = 2;  // meaningful only for play
+  uint32 tile_high = 3; // meaningful only for play
+  string end = 4;       // left | right -- meaningful only for play once the board is non-empty
+}
+
+// MessageSettleDomino reveals the seed and the full move log; the plugin
+// replays both to derive the winner independently.
+message MessageSettleDomino {
+  bytes operator_address = 1;               // @gotags: json:operatorAddress
+  bytes round_id = 2;                       // @gotags: json:roundID
+  bytes seed = 3;                           // revealed; sha256(seed) must equal the commitment
+  repeated DominoMoveRecord moves = 4;
+}
+
+// MessageExpireDomino refunds both entry fees for a round the operator never
+// settled, once ROOM_EXPIRY_BLOCKS have passed. Callable by anyone.
+message MessageExpireDomino {
+  bytes caller_address = 1; // @gotags: json:callerAddress
+  bytes round_id = 2;       // @gotags: json:roundID
+}
+
+// DominoRound is the on-chain state record for a round.
+message DominoRound {
+  bytes round_id = 1;                        // @gotags: json:roundID
+  bytes operator_address = 2;                // @gotags: json:operatorAddress
+  bytes commitment = 3;
+  uint64 entry_fee = 4;                      // @gotags: json:entryFee
+  uint64 rake_bps = 5;                       // @gotags: json:rakeBps
+  uint64 escrow_total = 6;                   // @gotags: json:escrowTotal
+  uint32 status = 7;                         // 0 = open, 1 = settled, 2 = expired (refunded)
+  repeated bytes participant_addresses = 8;  // @gotags: json:participantAddresses -- join order = player slot
+  uint64 opened_height = 9;                  // @gotags: json:openedHeight
+  bytes seed = 10;                           // revealed seed, empty until settled
+  repeated uint32 winner_slots = 11;          // @gotags: json:winnerSlots -- >1 entry only on a tied block
+  string result_reason = 12;                 // @gotags: json:resultReason -- emptied_hand | blocked
+}
