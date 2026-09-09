@@ -46,6 +46,7 @@ from .proto import account_pb2, event_pb2, plugin_pb2, tx_pb2
 from google.protobuf import any_pb2
 from .proto.tx_pb2 import (
     MessageOpenRoom,
+    MessageCloseRoom,
     MessageJoinRoom,
     MessageSettleRoom,
     MessageExpireRoom,
@@ -60,17 +61,20 @@ from .proto.tx_pb2 import (
     GemBalance,
     Cosmetic,
     MessageOpenRoulette,
+    MessageCloseRoulette,
     MessageRouletteBet,
     MessageSettleRoulette,
     MessageExpireRoulette,
     RouletteRound,
     RouletteBetRecord,
     MessageOpenDomino,
+    MessageCloseDomino,
     MessageJoinDomino,
     MessageSettleDomino,
     MessageExpireDomino,
     DominoRound,
     MessageOpenPoker,
+    MessageClosePoker,
     MessageJoinPoker,
     MessageSettlePoker,
     MessageExpirePoker,
@@ -123,12 +127,13 @@ CONTRACT_CONFIG = {
     "name": "python_plugin_contract",
     "id": 1,
     "version": 1,
-    "supported_transactions": ["send", "faucet", "reward", "open_room", "join_room", "settle_room", "expire_room", "buy_coins", "buy_gems", "transfer_gems", "mint_cosmetic", "buy_cosmetic", "transfer_cosmetic", "open_roulette", "roulette_bet", "settle_roulette", "expire_roulette", "open_domino", "join_domino", "settle_domino", "expire_domino", "open_poker", "join_poker", "settle_poker", "expire_poker"],
+    "supported_transactions": ["send", "faucet", "reward", "open_room", "close_room", "join_room", "settle_room", "expire_room", "buy_coins", "buy_gems", "transfer_gems", "mint_cosmetic", "buy_cosmetic", "transfer_cosmetic", "open_roulette", "close_roulette", "roulette_bet", "settle_roulette", "expire_roulette", "open_domino", "close_domino", "join_domino", "settle_domino", "expire_domino", "open_poker", "close_poker", "join_poker", "settle_poker", "expire_poker"],
     "transaction_type_urls": [
         "type.googleapis.com/types.MessageSend",
         "type.googleapis.com/types.MessageFaucet",
         "type.googleapis.com/types.MessageReward",
         "type.googleapis.com/types.MessageOpenRoom",
+        "type.googleapis.com/types.MessageCloseRoom",
         "type.googleapis.com/types.MessageJoinRoom",
         "type.googleapis.com/types.MessageSettleRoom",
         "type.googleapis.com/types.MessageExpireRoom",
@@ -139,14 +144,17 @@ CONTRACT_CONFIG = {
         "type.googleapis.com/types.MessageBuyCosmetic",
         "type.googleapis.com/types.MessageTransferCosmetic",
         "type.googleapis.com/types.MessageOpenRoulette",
+        "type.googleapis.com/types.MessageCloseRoulette",
         "type.googleapis.com/types.MessageRouletteBet",
         "type.googleapis.com/types.MessageSettleRoulette",
         "type.googleapis.com/types.MessageExpireRoulette",
         "type.googleapis.com/types.MessageOpenDomino",
+        "type.googleapis.com/types.MessageCloseDomino",
         "type.googleapis.com/types.MessageJoinDomino",
         "type.googleapis.com/types.MessageSettleDomino",
         "type.googleapis.com/types.MessageExpireDomino",
         "type.googleapis.com/types.MessageOpenPoker",
+        "type.googleapis.com/types.MessageClosePoker",
         "type.googleapis.com/types.MessageJoinPoker",
         "type.googleapis.com/types.MessageSettlePoker",
         "type.googleapis.com/types.MessageExpirePoker",
@@ -386,6 +394,30 @@ def poker_escrow_address(round_id: bytes) -> bytes:
     return hashlib.sha256(b"poker-escrow" + bytes(round_id)).digest()[:20]
 
 
+# -- Fair randomness v2: per-round operator bond sub-accounts -----------------
+# The operator escrows `operator_bond` into one of these at open. A settle that
+# consumes the round's (unpredictable, consensus-fixed) entropy returns the
+# bond; letting the round expire unsettled slashes the bond to the treasury.
+# So an operator who dislikes a revealed outcome can only abandon the round at
+# a cost, and every stake is then refunded deterministically. Distinct salts
+# from the escrow addresses so a round's bond and its escrow never collide.
+
+def bingo_bond_address(round_id: bytes) -> bytes:
+    return hashlib.sha256(b"bingo-bond" + bytes(round_id)).digest()[:20]
+
+
+def roulette_bond_address(round_id: bytes) -> bytes:
+    return hashlib.sha256(b"roulette-bond" + bytes(round_id)).digest()[:20]
+
+
+def domino_bond_address(round_id: bytes) -> bytes:
+    return hashlib.sha256(b"domino-bond" + bytes(round_id)).digest()[:20]
+
+
+def poker_bond_address(round_id: bytes) -> bytes:
+    return hashlib.sha256(b"poker-bond" + bytes(round_id)).digest()[:20]
+
+
 class Contract:
     """
     Contract defines the smart contract that implements the extended logic of the nested chain.
@@ -486,6 +518,85 @@ class Contract:
             window.append(v)
         return fold_consensus_entropy(window), None
 
+    # -- Fair randomness v2: shared close / settle-entropy plumbing -----------
+
+    def _check_message_close(self, msg) -> PluginCheckResponse:
+        """Stateless validation shared by every MessageClose<Game>. Only an
+        operator may close a round; the deliver step enforces the round exists,
+        is open, and belongs to this operator."""
+        if len(msg.operator_address) != 20:
+            raise err_invalid_address()
+        if msg.operator_address not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
+        if not msg.round_id:
+            raise PluginError(1, "plugin", "empty round_id")
+        r = PluginCheckResponse()
+        r.authorized_signers.append(msg.operator_address)
+        return r
+
+    async def _deliver_close_round(self, round_key, round_type, msg, height: int) -> PluginDeliverResponse:
+        """Shared MessageClose<Game> deliver logic: move an OPEN round to CLOSED
+        and stamp the consensus-entropy window settle will fold. None of the
+        window blocks (entropy_start..entropy_end) exist yet at `height`, so at
+        the moment betting stops the outcome is not determined by anyone."""
+        self._check_message_close(msg)
+        if not self.plugin or not self.config:
+            raise PluginError(1, "plugin", "plugin or config not initialized")
+        val, err = await self._read_one(round_key)
+        if err:
+            out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
+        rr = unmarshal(round_type, val) if val else None
+        if rr is None:
+            raise PluginError(1, "plugin", "round not found")
+        if rr.status != 0:
+            raise PluginError(1, "plugin", "round is not open")
+        if bytes(rr.operator_address) != bytes(msg.operator_address):
+            raise PluginError(1, "plugin", "only the operator can close")
+        rr.status = 3  # closed: entropy window fixed, awaiting settle
+        rr.close_height = height
+        rr.entropy_start = height + ENTROPY_DELAY_BLOCKS
+        rr.entropy_end = rr.entropy_start + ENTROPY_WINDOW_BLOCKS - 1
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(
+            sets=[PluginSetOp(key=round_key, value=marshal(rr))]))
+        out = PluginDeliverResponse()
+        if w.HasField("error"):
+            out.error.CopyFrom(w.error)
+        return out
+
+    async def _settle_final_seed(self, rr, operator_secret: bytes, round_id: bytes, height: int) -> bytes:
+        """The seed every money game replays its outcome from at settle. The
+        round must be CLOSED and its entropy window fully finalized; the plugin
+        authenticates the entropy from its own FSM-fed ledger (never from the
+        settlement message). Raises PluginError (fail closed) otherwise."""
+        if rr.status == 1:
+            raise PluginError(1, "plugin", "round already settled")
+        if rr.status == 2:
+            raise PluginError(1, "plugin", "round already refunded")
+        if rr.status != 3:
+            raise PluginError(1, "plugin", "round is not closed")
+        if height <= rr.entropy_end:
+            raise PluginError(1, "plugin", "entropy not yet available")
+        entropy, eerr = await self._fold_consensus_entropy(rr.entropy_start, rr.entropy_end)
+        if eerr is not None:
+            if isinstance(eerr, PluginError):
+                raise eerr
+            raise PluginError(eerr.code, eerr.module, eerr.msg)
+        return rng_v2_seed(operator_secret, entropy, round_id)
+
+    def _require_expirable(self, rr, height: int) -> None:
+        """Shared MessageExpire<Game> gate. A round is refundable once it is
+        OPEN or CLOSED (never after settle/refund) and has passed its deadline:
+        `opened_height + ROOM_EXPIRY_BLOCKS`, or -- once closed -- also
+        `entropy_end + SETTLE_GRACE_BLOCKS`, so a closed-but-unsettled round
+        still frees its stakes. Raises PluginError (fail closed) otherwise."""
+        if rr.status not in (0, 3):
+            raise PluginError(1, "plugin", "round is not open or closed")
+        deadline = rr.opened_height + ROOM_EXPIRY_BLOCKS
+        if rr.status == 3:
+            deadline = max(deadline, rr.entropy_end + SETTLE_GRACE_BLOCKS)
+        if height < deadline:
+            raise err_room_not_expired()
+
     async def check_tx(self, request: PluginCheckRequest) -> PluginCheckResponse:
         """CheckTx is code that is executed to statelessly validate a transaction."""
         try:
@@ -536,6 +647,10 @@ class Contract:
                 msg = MessageOpenRoom()
                 msg.ParseFromString(request.tx.msg.value)
                 return self._check_message_open_room(msg)
+            elif type_url.endswith("/types.MessageCloseRoom"):
+                msg = MessageCloseRoom()
+                msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_close(msg)
             elif type_url.endswith("/types.MessageJoinRoom"):
                 msg = MessageJoinRoom()
                 msg.ParseFromString(request.tx.msg.value)
@@ -569,6 +684,9 @@ class Contract:
             elif type_url.endswith("/types.MessageOpenRoulette"):
                 msg = MessageOpenRoulette(); msg.ParseFromString(request.tx.msg.value)
                 return self._check_message_open_roulette(msg)
+            elif type_url.endswith("/types.MessageCloseRoulette"):
+                msg = MessageCloseRoulette(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_close(msg)
             elif type_url.endswith("/types.MessageRouletteBet"):
                 msg = MessageRouletteBet(); msg.ParseFromString(request.tx.msg.value)
                 return self._check_message_roulette_bet(msg)
@@ -581,6 +699,9 @@ class Contract:
             elif type_url.endswith("/types.MessageOpenDomino"):
                 msg = MessageOpenDomino(); msg.ParseFromString(request.tx.msg.value)
                 return self._check_message_open_domino(msg)
+            elif type_url.endswith("/types.MessageCloseDomino"):
+                msg = MessageCloseDomino(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_close(msg)
             elif type_url.endswith("/types.MessageJoinDomino"):
                 msg = MessageJoinDomino(); msg.ParseFromString(request.tx.msg.value)
                 return self._check_message_join_domino(msg)
@@ -593,6 +714,9 @@ class Contract:
             elif type_url.endswith("/types.MessageOpenPoker"):
                 msg = MessageOpenPoker(); msg.ParseFromString(request.tx.msg.value)
                 return self._check_message_open_poker(msg)
+            elif type_url.endswith("/types.MessageClosePoker"):
+                msg = MessageClosePoker(); msg.ParseFromString(request.tx.msg.value)
+                return self._check_message_close(msg)
             elif type_url.endswith("/types.MessageJoinPoker"):
                 msg = MessageJoinPoker(); msg.ParseFromString(request.tx.msg.value)
                 return self._check_message_join_poker(msg)
@@ -639,6 +763,11 @@ class Contract:
                 msg = MessageOpenRoom()
                 msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_open_room(msg, request.height)
+            elif type_url.endswith("/types.MessageCloseRoom"):
+                msg = MessageCloseRoom()
+                msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_close_round(
+                    key_for_round(msg.round_id), RoomRound, msg, request.height)
             elif type_url.endswith("/types.MessageJoinRoom"):
                 msg = MessageJoinRoom()
                 msg.ParseFromString(request.tx.msg.value)
@@ -646,7 +775,7 @@ class Contract:
             elif type_url.endswith("/types.MessageSettleRoom"):
                 msg = MessageSettleRoom()
                 msg.ParseFromString(request.tx.msg.value)
-                return await self._deliver_message_settle_room(msg)
+                return await self._deliver_message_settle_room(msg, request.height)
             elif type_url.endswith("/types.MessageExpireRoom"):
                 msg = MessageExpireRoom()
                 msg.ParseFromString(request.tx.msg.value)
@@ -672,36 +801,48 @@ class Contract:
             elif type_url.endswith("/types.MessageOpenRoulette"):
                 msg = MessageOpenRoulette(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_open_roulette(msg, request.height)
+            elif type_url.endswith("/types.MessageCloseRoulette"):
+                msg = MessageCloseRoulette(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_close_round(
+                    key_for_roulette_round(msg.round_id), RouletteRound, msg, request.height)
             elif type_url.endswith("/types.MessageRouletteBet"):
                 msg = MessageRouletteBet(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_roulette_bet(msg)
             elif type_url.endswith("/types.MessageSettleRoulette"):
                 msg = MessageSettleRoulette(); msg.ParseFromString(request.tx.msg.value)
-                return await self._deliver_message_settle_roulette(msg)
+                return await self._deliver_message_settle_roulette(msg, request.height)
             elif type_url.endswith("/types.MessageExpireRoulette"):
                 msg = MessageExpireRoulette(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_expire_roulette(msg, request.height)
             elif type_url.endswith("/types.MessageOpenDomino"):
                 msg = MessageOpenDomino(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_open_domino(msg, request.height)
+            elif type_url.endswith("/types.MessageCloseDomino"):
+                msg = MessageCloseDomino(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_close_round(
+                    key_for_domino_round(msg.round_id), DominoRound, msg, request.height)
             elif type_url.endswith("/types.MessageJoinDomino"):
                 msg = MessageJoinDomino(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_join_domino(msg)
             elif type_url.endswith("/types.MessageSettleDomino"):
                 msg = MessageSettleDomino(); msg.ParseFromString(request.tx.msg.value)
-                return await self._deliver_message_settle_domino(msg)
+                return await self._deliver_message_settle_domino(msg, request.height)
             elif type_url.endswith("/types.MessageExpireDomino"):
                 msg = MessageExpireDomino(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_expire_domino(msg, request.height)
             elif type_url.endswith("/types.MessageOpenPoker"):
                 msg = MessageOpenPoker(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_open_poker(msg, request.height)
+            elif type_url.endswith("/types.MessageClosePoker"):
+                msg = MessageClosePoker(); msg.ParseFromString(request.tx.msg.value)
+                return await self._deliver_close_round(
+                    key_for_poker_round(msg.round_id), PokerRound, msg, request.height)
             elif type_url.endswith("/types.MessageJoinPoker"):
                 msg = MessageJoinPoker(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_join_poker(msg)
             elif type_url.endswith("/types.MessageSettlePoker"):
                 msg = MessageSettlePoker(); msg.ParseFromString(request.tx.msg.value)
-                return await self._deliver_message_settle_poker(msg)
+                return await self._deliver_message_settle_poker(msg, request.height)
             elif type_url.endswith("/types.MessageExpirePoker"):
                 msg = MessageExpirePoker(); msg.ParseFromString(request.tx.msg.value)
                 return await self._deliver_message_expire_poker(msg, request.height)
@@ -1015,6 +1156,8 @@ class Contract:
             raise PluginError(1, "plugin", "payout_weights_bps must sum to 10000")
         if any(w == 0 for w in msg.payout_weights_bps):
             raise PluginError(1, "plugin", "payout weights must be positive")
+        if msg.operator_bond == 0:
+            raise PluginError(1, "plugin", "operator_bond must be positive")
         r = PluginCheckResponse()
         r.authorized_signers.append(msg.operator_address)
         return r
@@ -1064,11 +1207,10 @@ class Contract:
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_round(msg.round_id)
-        val, err = await self._read_one(round_key)
+        bond_sets, err = await self._prepare_open(
+            round_key, msg.operator_address, bingo_bond_address(msg.round_id), msg.operator_bond)
         if err:
             out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
-        if val:
-            raise PluginError(1, "plugin", "round already exists")
         rr = RoomRound()
         rr.round_id = msg.round_id
         rr.operator_address = msg.operator_address
@@ -1080,8 +1222,9 @@ class Contract:
         rr.status = 0
         rr.payout_weights_bps.extend(list(msg.payout_weights_bps) or [10000])
         rr.opened_height = height
+        rr.operator_bond = msg.operator_bond
         w = await self.plugin.state_write(self, PluginStateWriteRequest(
-            sets=[PluginSetOp(key=round_key, value=marshal(rr))]))
+            sets=bond_sets + [PluginSetOp(key=round_key, value=marshal(rr))]))
         out = PluginDeliverResponse()
         if w.HasField("error"):
             out.error.CopyFrom(w.error)
@@ -1102,10 +1245,7 @@ class Contract:
         rr = unmarshal(RoomRound, val) if val else None
         if rr is None:
             raise PluginError(1, "plugin", "round not found")
-        if rr.status != 0:
-            raise PluginError(1, "plugin", "round is not open")
-        if height < rr.opened_height + ROOM_EXPIRY_BLOCKS:
-            raise err_room_not_expired()
+        self._require_expirable(rr, height)
 
         participant_addrs = [bytes(a) for a in rr.participant_addresses]
         escrow_key = key_for_account(escrow_address(msg.round_id))
@@ -1135,6 +1275,10 @@ class Contract:
             amount = part.amount if part else 0
             if amount <= 0:
                 continue
+            if addr == TREASURY_ADDRESS:
+                # would collide with the operator-bond slash below; the house
+                # treasury is never a player, so fail closed rather than mis-account.
+                raise PluginError(1, "plugin", "treasury cannot be a round participant")
             acct_bytes = by_qid.get(acct_qids[addr])
             acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
             if acct.amount > UINT64_MAX - amount:
@@ -1147,6 +1291,11 @@ class Contract:
             raise PluginError(1, "plugin", "escrow underfunded")
         escrow.amount -= total_refunded
         sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
+        bond_sets, berr = await self._bond_move_sets(
+            bingo_bond_address(msg.round_id), rr.operator_bond, TREASURY_ADDRESS)
+        if berr is not None:
+            out = PluginDeliverResponse(); out.error.CopyFrom(berr); return out
+        sets.extend(bond_sets)
         rr.status = 2  # expired/refunded
         sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
 
@@ -1188,6 +1337,8 @@ class Contract:
             raise PluginError(1, "plugin", "round not found")
         if rr.status != 0:
             raise PluginError(1, "plugin", "round not open")
+        if bytes(msg.player_address) == bytes(rr.operator_address):
+            raise PluginError(1, "plugin", "the operator cannot play its own round")
         if pb:
             raise PluginError(1, "plugin", "player already joined")
         expected = rr.entry_fee * gecon.CARD_COST_MULTIPLIER_BPS[msg.num_cards] // 10000
@@ -1221,10 +1372,13 @@ class Contract:
             out.error.CopyFrom(w.error)
         return out
 
-    async def _deliver_message_settle_room(self, msg) -> PluginDeliverResponse:
-        """Trustless settle: operator only reveals the seed. The plugin recomputes
-        every participant's cards from the seed, ranks the winners by who completes
-        the pattern first, and pays the top ranks by the round's payout weights."""
+    async def _deliver_message_settle_room(self, msg, height: int = 0) -> PluginDeliverResponse:
+        """Trustless settle: operator only reveals the seed. The round must have
+        been CLOSED first; the plugin folds the consensus entropy its own ledger
+        fixed for the round, derives the replay seed from that plus the revealed
+        operator secret, then recomputes every participant's cards, ranks the
+        winners by who completes the pattern first, and pays the top ranks by
+        the round's payout weights. The operator bond is returned on success."""
         self._check_message_settle_room(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
@@ -1235,14 +1389,14 @@ class Contract:
         rr = unmarshal(RoomRound, val) if val else None
         if rr is None:
             raise PluginError(1, "plugin", "round not found")
-        if rr.status != 0:
-            raise PluginError(1, "plugin", "round already settled")
         if bytes(rr.operator_address) != bytes(msg.operator_address):
             raise PluginError(1, "plugin", "only the operator can settle")
         if seed_commitment(bytes(msg.seed)) != bytes(rr.commitment):
             raise PluginError(1, "plugin", "seed does not match commitment")
-        # recompute the ranking from the revealed seed (fully determined on-chain)
-        seed = bytes(msg.seed)
+        # fair-randomness-v2: replay from SHA256(secret || consensus_entropy || round_id),
+        # not the raw revealed secret -- the operator cannot have known this at close.
+        seed = await self._settle_final_seed(
+            rr, bytes(msg.seed), bytes(msg.round_id), height)
         order = gdraw.draw_order(seed)
         pattern = grules.Pattern(msg.pattern or "line")
         ranked = []
@@ -1305,6 +1459,11 @@ class Contract:
                 raise err_invalid_amount()
             acct.amount += payouts[i]
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
+        bond_sets, berr = await self._bond_move_sets(
+            bingo_bond_address(msg.round_id), rr.operator_bond, rr.operator_address)
+        if berr is not None:
+            out = PluginDeliverResponse(); out.error.CopyFrom(berr); return out
+        sets.extend(bond_sets)
         rr.status = 1
         sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
         w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=sets))
@@ -1329,6 +1488,8 @@ class Contract:
         # "operate" a room), not something to carry into a new message type.
         if msg.operator_address not in ADMIN_ADDRESSES:
             raise err_unauthorized_signer()
+        if msg.operator_bond == 0:
+            raise PluginError(1, "plugin", "operator_bond must be positive")
         r = PluginCheckResponse()
         r.authorized_signers.append(msg.operator_address)
         return r
@@ -1374,11 +1535,10 @@ class Contract:
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_roulette_round(msg.round_id)
-        val, err = await self._read_one(round_key)
+        bond_sets, err = await self._prepare_open(
+            round_key, msg.operator_address, roulette_bond_address(msg.round_id), msg.operator_bond)
         if err:
             out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
-        if val:
-            raise PluginError(1, "plugin", "round already exists")
         rr = RouletteRound()
         rr.round_id = msg.round_id
         rr.operator_address = msg.operator_address
@@ -1387,8 +1547,9 @@ class Contract:
         rr.pot_total = 0
         rr.status = 0
         rr.opened_height = height
+        rr.operator_bond = msg.operator_bond
         w = await self.plugin.state_write(self, PluginStateWriteRequest(
-            sets=[PluginSetOp(key=round_key, value=marshal(rr))]))
+            sets=bond_sets + [PluginSetOp(key=round_key, value=marshal(rr))]))
         out = PluginDeliverResponse()
         if w.HasField("error"):
             out.error.CopyFrom(w.error)
@@ -1430,6 +1591,8 @@ class Contract:
             raise PluginError(1, "plugin", "round not found")
         if rr.status != 0:
             raise PluginError(1, "plugin", "round not open")
+        if bytes(msg.player_address) == bytes(rr.operator_address):
+            raise PluginError(1, "plugin", "the operator cannot bet in its own round")
         if bb:
             raise PluginError(1, "plugin", "address already has a bet in this round")
         treasury = unmarshal(Account, tb) if tb else Account()
@@ -1471,15 +1634,16 @@ class Contract:
             out.error.CopyFrom(w.error)
         return out
 
-    async def _deliver_message_settle_roulette(self, msg) -> PluginDeliverResponse:
-        """Trustless settle: operator only reveals the seed. The plugin
-        recomputes the spin from the seed and pays every bettor whose bet
-        matches -- exactly like Bingo's settle recomputes cards rather than
-        trusting a claimed outcome. Unlike Bingo (where the whole pot is split
-        among ranked winners), each roulette bettor is paid independently off
-        their own bet's odds; whatever the escrow doesn't pay out (losing
-        stakes) plus the rake skimmed off winning payouts both go to the
-        treasury, so escrow always ends a settle at exactly zero."""
+    async def _deliver_message_settle_roulette(self, msg, height: int = 0) -> PluginDeliverResponse:
+        """Trustless settle: operator only reveals the seed. The round must have
+        been CLOSED first; the plugin folds the consensus entropy its ledger
+        fixed for the round, derives the replay seed, recomputes the spin and
+        pays every bettor whose bet matches. Unlike Bingo (where the whole pot
+        is split among ranked winners), each roulette bettor is paid
+        independently off their own bet's odds; whatever the escrow doesn't pay
+        out (losing stakes) plus the rake skimmed off winning payouts both go
+        to the treasury, so escrow always ends a settle at exactly zero. The
+        operator bond is returned on success."""
         self._check_message_settle_roulette(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
@@ -1490,14 +1654,14 @@ class Contract:
         rr = unmarshal(RouletteRound, val) if val else None
         if rr is None:
             raise PluginError(1, "plugin", "round not found")
-        if rr.status != 0:
-            raise PluginError(1, "plugin", "round already settled")
         if bytes(rr.operator_address) != bytes(msg.operator_address):
             raise PluginError(1, "plugin", "only the operator can settle")
         if seed_commitment(bytes(msg.seed)) != bytes(rr.commitment):
             raise PluginError(1, "plugin", "seed does not match commitment")
 
-        spin = groulette.spin_number(bytes(msg.seed))
+        seed = await self._settle_final_seed(
+            rr, bytes(msg.seed), bytes(msg.round_id), height)
+        spin = groulette.spin_number(seed)
         bettors = [bytes(a) for a in rr.bettor_addresses]
 
         escrow_key = key_for_account(roulette_escrow_address(msg.round_id))
@@ -1570,6 +1734,12 @@ class Contract:
         sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
         sets.append(PluginSetOp(key=treasury_key, value=marshal(treasury)))
 
+        bond_sets, berr = await self._bond_move_sets(
+            roulette_bond_address(msg.round_id), rr.operator_bond, rr.operator_address)
+        if berr is not None:
+            out = PluginDeliverResponse(); out.error.CopyFrom(berr); return out
+        sets.extend(bond_sets)
+
         rr.status = 1
         rr.seed = msg.seed
         rr.spin = spin
@@ -1595,10 +1765,7 @@ class Contract:
         rr = unmarshal(RouletteRound, val) if val else None
         if rr is None:
             raise PluginError(1, "plugin", "round not found")
-        if rr.status != 0:
-            raise PluginError(1, "plugin", "round is not open")
-        if height < rr.opened_height + ROOM_EXPIRY_BLOCKS:
-            raise err_room_not_expired()
+        self._require_expirable(rr, height)
 
         bettors = [bytes(a) for a in rr.bettor_addresses]
         escrow_key = key_for_account(roulette_escrow_address(msg.round_id))
@@ -1648,6 +1815,13 @@ class Contract:
             raise err_invalid_amount()
         treasury.amount += reserve_release
         escrow.amount = 0
+        # slash the operator bond to the treasury it is already mutating here
+        bond_sets, berr = await self._bond_move_sets(
+            roulette_bond_address(msg.round_id), rr.operator_bond,
+            TREASURY_ADDRESS, dest_acct=treasury)
+        if berr is not None:
+            out = PluginDeliverResponse(); out.error.CopyFrom(berr); return out
+        sets.extend(bond_sets)
         sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
         sets.append(PluginSetOp(key=treasury_key, value=marshal(treasury)))
         rr.status = 2  # expired/refunded
@@ -1674,6 +1848,8 @@ class Contract:
             raise PluginError(1, "plugin", "rake_bps must be <= 10000")
         if msg.operator_address not in ADMIN_ADDRESSES:
             raise err_unauthorized_signer()
+        if msg.operator_bond == 0:
+            raise PluginError(1, "plugin", "operator_bond must be positive")
         r = PluginCheckResponse()
         r.authorized_signers.append(msg.operator_address)
         return r
@@ -1719,11 +1895,10 @@ class Contract:
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_domino_round(msg.round_id)
-        val, err = await self._read_one(round_key)
+        bond_sets, err = await self._prepare_open(
+            round_key, msg.operator_address, domino_bond_address(msg.round_id), msg.operator_bond)
         if err:
             out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
-        if val:
-            raise PluginError(1, "plugin", "round already exists")
         rr = DominoRound()
         rr.round_id = msg.round_id
         rr.operator_address = msg.operator_address
@@ -1733,8 +1908,9 @@ class Contract:
         rr.escrow_total = 0
         rr.status = 0
         rr.opened_height = height
+        rr.operator_bond = msg.operator_bond
         w = await self.plugin.state_write(self, PluginStateWriteRequest(
-            sets=[PluginSetOp(key=round_key, value=marshal(rr))]))
+            sets=bond_sets + [PluginSetOp(key=round_key, value=marshal(rr))]))
         out = PluginDeliverResponse()
         if w.HasField("error"):
             out.error.CopyFrom(w.error)
@@ -1768,6 +1944,8 @@ class Contract:
             raise PluginError(1, "plugin", "round not found")
         if rr.status != 0:
             raise PluginError(1, "plugin", "round not open")
+        if bytes(msg.player_address) == bytes(rr.operator_address):
+            raise PluginError(1, "plugin", "the operator cannot play its own round")
         if len(rr.participant_addresses) >= gdomino.NUM_PLAYERS:
             raise PluginError(1, "plugin", "round already has enough players")
         if bytes(msg.player_address) in [bytes(a) for a in rr.participant_addresses]:
@@ -1792,7 +1970,7 @@ class Contract:
             out.error.CopyFrom(w.error)
         return out
 
-    async def _deliver_message_settle_domino(self, msg) -> PluginDeliverResponse:
+    async def _deliver_message_settle_domino(self, msg, height: int = 0) -> PluginDeliverResponse:
         """Trustless settle: operator reveals the seed AND the full move log.
         The plugin replays both (deal derived from the seed, each move
         validated legal in sequence) to derive the winner itself -- exactly
@@ -1810,8 +1988,6 @@ class Contract:
         rr = unmarshal(DominoRound, val) if val else None
         if rr is None:
             raise PluginError(1, "plugin", "round not found")
-        if rr.status != 0:
-            raise PluginError(1, "plugin", "round already settled")
         if bytes(rr.operator_address) != bytes(msg.operator_address):
             raise PluginError(1, "plugin", "only the operator can settle")
         if seed_commitment(bytes(msg.seed)) != bytes(rr.commitment):
@@ -1819,6 +1995,8 @@ class Contract:
         if len(rr.participant_addresses) != gdomino.NUM_PLAYERS:
             raise PluginError(1, "plugin", "round never filled both seats")
 
+        seed = await self._settle_final_seed(
+            rr, bytes(msg.seed), bytes(msg.round_id), height)
         moves = [
             gdomino.Move(action=m.action,
                          tile=(m.tile_low, m.tile_high) if m.action == "play" else None,
@@ -1826,7 +2004,7 @@ class Contract:
             for m in msg.moves
         ]
         try:
-            result = gdomino.replay(bytes(msg.seed), moves)
+            result = gdomino.replay(seed, moves)
         except gdomino.IllegalMove as exc:
             raise PluginError(1, "plugin", f"illegal move in claimed log: {exc}")
 
@@ -1875,6 +2053,12 @@ class Contract:
             acct.amount += payouts[i]
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
 
+        bond_sets, berr = await self._bond_move_sets(
+            domino_bond_address(msg.round_id), rr.operator_bond, rr.operator_address)
+        if berr is not None:
+            out = PluginDeliverResponse(); out.error.CopyFrom(berr); return out
+        sets.extend(bond_sets)
+
         rr.status = 1
         rr.seed = msg.seed
         rr.winner_slots.extend(result.winners)
@@ -1901,10 +2085,7 @@ class Contract:
         rr = unmarshal(DominoRound, val) if val else None
         if rr is None:
             raise PluginError(1, "plugin", "round not found")
-        if rr.status != 0:
-            raise PluginError(1, "plugin", "round is not open")
-        if height < rr.opened_height + ROOM_EXPIRY_BLOCKS:
-            raise err_room_not_expired()
+        self._require_expirable(rr, height)
 
         participants = [bytes(a) for a in rr.participant_addresses]
         escrow_key = key_for_account(domino_escrow_address(msg.round_id))
@@ -1926,6 +2107,8 @@ class Contract:
         sets = []
         total_refunded = 0
         for addr in participants:
+            if addr == TREASURY_ADDRESS:
+                raise PluginError(1, "plugin", "treasury cannot be a round participant")
             acct_bytes = by_qid.get(acct_qids[addr])
             acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
             if acct.amount > UINT64_MAX - rr.entry_fee:
@@ -1938,6 +2121,11 @@ class Contract:
             raise PluginError(1, "plugin", "escrow underfunded")
         escrow.amount -= total_refunded
         sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
+        bond_sets, berr = await self._bond_move_sets(
+            domino_bond_address(msg.round_id), rr.operator_bond, TREASURY_ADDRESS)
+        if berr is not None:
+            out = PluginDeliverResponse(); out.error.CopyFrom(berr); return out
+        sets.extend(bond_sets)
         rr.status = 2  # expired/refunded
         sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
 
@@ -1964,6 +2152,8 @@ class Contract:
             raise PluginError(1, "plugin", "rake_bps must be <= 10000")
         if msg.operator_address not in ADMIN_ADDRESSES:
             raise err_unauthorized_signer()
+        if msg.operator_bond == 0:
+            raise PluginError(1, "plugin", "operator_bond must be positive")
         r = PluginCheckResponse()
         r.authorized_signers.append(msg.operator_address)
         return r
@@ -2009,11 +2199,10 @@ class Contract:
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_poker_round(msg.round_id)
-        val, err = await self._read_one(round_key)
+        bond_sets, err = await self._prepare_open(
+            round_key, msg.operator_address, poker_bond_address(msg.round_id), msg.operator_bond)
         if err:
             out = PluginDeliverResponse(); out.error.CopyFrom(err); return out
-        if val:
-            raise PluginError(1, "plugin", "round already exists")
         rr = PokerRound()
         rr.round_id = msg.round_id
         rr.operator_address = msg.operator_address
@@ -2025,8 +2214,9 @@ class Contract:
         rr.escrow_total = 0
         rr.status = 0
         rr.opened_height = height
+        rr.operator_bond = msg.operator_bond
         w = await self.plugin.state_write(self, PluginStateWriteRequest(
-            sets=[PluginSetOp(key=round_key, value=marshal(rr))]))
+            sets=bond_sets + [PluginSetOp(key=round_key, value=marshal(rr))]))
         out = PluginDeliverResponse()
         if w.HasField("error"):
             out.error.CopyFrom(w.error)
@@ -2060,6 +2250,8 @@ class Contract:
             raise PluginError(1, "plugin", "round not found")
         if rr.status != 0:
             raise PluginError(1, "plugin", "round not open")
+        if bytes(msg.player_address) == bytes(rr.operator_address):
+            raise PluginError(1, "plugin", "the operator cannot play its own round")
         if len(rr.participant_addresses) >= gpoker.NUM_PLAYERS:
             raise PluginError(1, "plugin", "round already has enough players")
         if bytes(msg.player_address) in [bytes(a) for a in rr.participant_addresses]:
@@ -2084,7 +2276,7 @@ class Contract:
             out.error.CopyFrom(w.error)
         return out
 
-    async def _deliver_message_settle_poker(self, msg) -> PluginDeliverResponse:
+    async def _deliver_message_settle_poker(self, msg, height: int = 0) -> PluginDeliverResponse:
         """Trustless settle: operator reveals the seed AND the full betting
         action log. The plugin replays both the deal (from the seed) and
         every action (validated legal at the time it was made) to derive the
@@ -2103,8 +2295,6 @@ class Contract:
         rr = unmarshal(PokerRound, val) if val else None
         if rr is None:
             raise PluginError(1, "plugin", "round not found")
-        if rr.status != 0:
-            raise PluginError(1, "plugin", "round already settled")
         if bytes(rr.operator_address) != bytes(msg.operator_address):
             raise PluginError(1, "plugin", "only the operator can settle")
         if seed_commitment(bytes(msg.seed)) != bytes(rr.commitment):
@@ -2112,9 +2302,11 @@ class Contract:
         if len(rr.participant_addresses) != gpoker.NUM_PLAYERS:
             raise PluginError(1, "plugin", "round never filled both seats")
 
+        seed = await self._settle_final_seed(
+            rr, bytes(msg.seed), bytes(msg.round_id), height)
         actions = [gpoker.PokerAction(action=a.action, amount=a.amount) for a in msg.actions]
         try:
-            result = gpoker.replay(bytes(msg.seed), rr.small_blind, rr.big_blind,
+            result = gpoker.replay(seed, rr.small_blind, rr.big_blind,
                                     (rr.buy_in, rr.buy_in), actions)
         except gpoker.IllegalMove as exc:
             raise PluginError(1, "plugin", f"illegal action in claimed log: {exc}")
@@ -2168,6 +2360,12 @@ class Contract:
             acct.amount += final_payouts[addr]
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
 
+        bond_sets, berr = await self._bond_move_sets(
+            poker_bond_address(msg.round_id), rr.operator_bond, rr.operator_address)
+        if berr is not None:
+            out = PluginDeliverResponse(); out.error.CopyFrom(berr); return out
+        sets.extend(bond_sets)
+
         rr.status = 1
         rr.seed = msg.seed
         rr.winner_slots.extend(result.winners)
@@ -2195,10 +2393,7 @@ class Contract:
         rr = unmarshal(PokerRound, val) if val else None
         if rr is None:
             raise PluginError(1, "plugin", "round not found")
-        if rr.status != 0:
-            raise PluginError(1, "plugin", "round is not open")
-        if height < rr.opened_height + ROOM_EXPIRY_BLOCKS:
-            raise err_room_not_expired()
+        self._require_expirable(rr, height)
 
         participants = [bytes(a) for a in rr.participant_addresses]
         escrow_key = key_for_account(poker_escrow_address(msg.round_id))
@@ -2220,6 +2415,8 @@ class Contract:
         sets = []
         total_refunded = 0
         for addr in participants:
+            if addr == TREASURY_ADDRESS:
+                raise PluginError(1, "plugin", "treasury cannot be a round participant")
             acct_bytes = by_qid.get(acct_qids[addr])
             acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
             if acct.amount > UINT64_MAX - rr.buy_in:
@@ -2232,6 +2429,11 @@ class Contract:
             raise PluginError(1, "plugin", "escrow underfunded")
         escrow.amount -= total_refunded
         sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
+        bond_sets, berr = await self._bond_move_sets(
+            poker_bond_address(msg.round_id), rr.operator_bond, TREASURY_ADDRESS)
+        if berr is not None:
+            out = PluginDeliverResponse(); out.error.CopyFrom(berr); return out
+        sets.extend(bond_sets)
         rr.status = 2  # expired/refunded
         sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
 
@@ -2278,6 +2480,86 @@ class Contract:
             if r.query_id == qid:
                 val = r.entries[0].value if r.entries else None
         return val, None
+
+    async def _read_account(self, address):
+        """Load one Account by address (empty Account if absent).
+        Returns (account, None) or (None, error-proto)."""
+        val, err = await self._read_one(key_for_account(bytes(address)))
+        if err:
+            return None, err
+        return (unmarshal(Account, val) if val else Account()), None
+
+    async def _prepare_open(self, round_key, operator_address, bond_addr, bond_amount):
+        """Shared open path for every money game: reject a duplicate round, then
+        escrow the operator's fair-randomness-v2 bond from the operator account
+        into the round's bond sub-account. Returns (bond_sets, None) for the
+        caller to merge into its single round write, or raises PluginError.
+
+        The bond sub-account is a per-round, per-game salted address that holds
+        exactly `bond_amount` until settle returns it or expire slashes it."""
+        op_key = key_for_account(bytes(operator_address))
+        bond_key = key_for_account(bytes(bond_addr))
+        qr, qo, qb = (random.randint(0, 2**53) for _ in range(3))
+        resp = await self.plugin.state_read(self, PluginStateReadRequest(keys=[
+            PluginKeyRead(query_id=qr, key=round_key),
+            PluginKeyRead(query_id=qo, key=op_key),
+            PluginKeyRead(query_id=qb, key=bond_key),
+        ]))
+        if resp.HasField("error"):
+            return None, resp.error
+        rb = ob = bb = None
+        for r in resp.results:
+            if r.query_id == qr:
+                rb = r.entries[0].value if r.entries else None
+            elif r.query_id == qo:
+                ob = r.entries[0].value if r.entries else None
+            elif r.query_id == qb:
+                bb = r.entries[0].value if r.entries else None
+        if rb:
+            raise PluginError(1, "plugin", "round already exists")
+        op = unmarshal(Account, ob) if ob else Account()
+        bond = unmarshal(Account, bb) if bb else Account()
+        if op.amount < bond_amount:
+            raise err_insufficient_funds()
+        if bond.amount > UINT64_MAX - bond_amount:
+            raise err_invalid_amount()
+        op.amount -= bond_amount
+        bond.amount += bond_amount
+        return [PluginSetOp(key=op_key, value=marshal(op)),
+                PluginSetOp(key=bond_key, value=marshal(bond))], None
+
+    async def _bond_move_sets(self, bond_addr, bond_amount, dest_address, dest_acct=None):
+        """Move a round's operator bond out of its per-round sub-account to
+        `dest_address` (the operator on settle, the treasury on expire).
+        Returns (sets, err) -- `sets` is the pair of SetOps to append to the
+        caller's single write and `err` is None, or `sets` is None and `err`
+        is an error proto.
+
+        Pass `dest_acct` when the caller is already mutating the destination
+        account in the same tx (roulette expire folds the bond into the
+        treasury it has in flight). Otherwise the destination is loaded fresh;
+        callers must then ensure it is not otherwise written in the tx -- the
+        operator is an ADMIN address the join guards keep out of the
+        participant set, and the treasury is only ever double-touched by
+        roulette, which passes `dest_acct`."""
+        bond_acct, berr = await self._read_account(bond_addr)
+        if berr:
+            return None, berr
+        if bond_acct.amount < bond_amount:
+            raise PluginError(1, "plugin", "operator bond sub-account underfunded")
+        own_dest = dest_acct is None
+        if own_dest:
+            dest_acct, derr = await self._read_account(dest_address)
+            if derr:
+                return None, derr
+        if dest_acct.amount > UINT64_MAX - bond_amount:
+            raise err_invalid_amount()
+        bond_acct.amount -= bond_amount
+        dest_acct.amount += bond_amount
+        sets = [PluginSetOp(key=key_for_account(bytes(bond_addr)), value=marshal(bond_acct))]
+        if own_dest:
+            sets.append(PluginSetOp(key=key_for_account(bytes(dest_address)), value=marshal(dest_acct)))
+        return sets, None
 
     async def _deliver_buy_coins(self, msg):
         self._check_mint_like(msg.admin_address, msg.recipient_address, msg.amount)

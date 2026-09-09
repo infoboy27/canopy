@@ -15,10 +15,14 @@ from contract.contract import (
     Contract,
     ADMIN_ADDRESSES,
     ROOM_EXPIRY_BLOCKS,
+    SETTLE_GRACE_BLOCKS,
     TREASURY_ADDRESS,
     seed_commitment,
     key_for_account,
+    key_for_roulette_round,
     roulette_escrow_address,
+    roulette_bond_address,
+    rng_v2_seed,
     marshal,
     unmarshal,
 )
@@ -38,28 +42,42 @@ from contract.proto.tx_pb2 import (
     MessageRouletteBet,
     MessageSettleRoulette,
     MessageExpireRoulette,
+    RouletteRound,
 )
 from contract.game import roulette as groulette
+from tests.test_room_lifecycle import (
+    OPERATOR_BOND, fund_operator, close_round, entropy_for_close_height,
+)
 
 ADMIN = next(iter(ADMIN_ADDRESSES))
 PLAYER_A = b"p" * 20
 PLAYER_B = b"q" * 20
 PLAYER_C = b"r" * 20
 
-
-def find_seed_for_spin(target_spin: int, start: int = 0) -> bytes:
-    """The spin is derived from the seed via unbiased rejection sampling, so
-    there's no closed-form inverse -- brute-force a seed whose derived spin
-    equals the target so tests can pin exact outcomes."""
-    for i in range(start, start + 100_000):
-        seed = f"seed-{i}".encode().ljust(32, b"\x00")
-        if groulette.spin_number(seed) == target_spin:
-            return seed
-    raise AssertionError(f"no seed found for spin {target_spin} in range")
+DEFAULT_RID = b"round001"
+DEFAULT_OPEN_HEIGHT = 1000
+DEFAULT_CLOSE_HEIGHT = DEFAULT_OPEN_HEIGHT + 1
 
 
-SEED_FOR_1 = find_seed_for_spin(1)   # red, odd, low, dozen1, col1
-SEED_FOR_0 = find_seed_for_spin(0)   # green -- every outside bet loses
+def secret_for_spin(target_spin, round_id=DEFAULT_RID, close_height=DEFAULT_CLOSE_HEIGHT, start=0):
+    """Brute-force a revealed operator secret whose fair-randomness-v2 replay
+    seed -- SHA256(secret || consensus_entropy || round_id) -- lands the wheel
+    on `target_spin`. The consensus entropy is fixed by `close_round`, so this
+    can be computed before the round even opens."""
+    entropy = entropy_for_close_height(close_height)
+    for i in range(start, start + 5_000_000):
+        secret = f"seed-{i}".encode().ljust(32, b"\x00")
+        if groulette.spin_number(rng_v2_seed(secret, entropy, round_id)) == target_spin:
+            return secret
+    raise AssertionError(f"no secret found for spin {target_spin}")
+
+
+SEED_FOR_1 = secret_for_spin(1)   # red, odd, low, dozen1, col1
+SEED_FOR_0 = secret_for_spin(0)   # green -- every outside bet loses
+
+
+def close_roulette(contract, round_id=DEFAULT_RID, **kw):
+    return close_round(contract, round_id, key_for_roulette_round(round_id), RouletteRound, **kw)
 
 
 class FakeState:
@@ -105,10 +123,13 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def open_roulette(contract, round_id=b"round001", rake_bps=1000, height=1000,
-                   commitment=b"c" * 32, operator=ADMIN):
+def open_roulette(contract, round_id=DEFAULT_RID, rake_bps=1000, height=DEFAULT_OPEN_HEIGHT,
+                   commitment=b"c" * 32, operator=ADMIN, operator_bond=OPERATOR_BOND):
+    if operator == ADMIN:
+        fund_operator(contract.plugin, operator_bond)
     msg = MessageOpenRoulette(operator_address=operator, round_id=round_id,
-                               commitment=commitment, rake_bps=rake_bps)
+                               commitment=commitment, rake_bps=rake_bps,
+                               operator_bond=operator_bond)
     resp = run(contract._deliver_message_open_roulette(msg, height))
     assert not resp.HasField("error"), resp.error.msg
     return round_id
@@ -149,9 +170,11 @@ class TestSettleRouletteHappyPath:
         place_bet(contract, state, PLAYER_A, rid, 100, "straight", 1)  # wins 36x = 3600
         place_bet(contract, state, PLAYER_B, rid, 100, "red")           # wins 2x = 200
         place_bet(contract, state, PLAYER_C, rid, 100, "black")         # loses
+        settle_height, _ = close_roulette(contract, rid)
 
         resp = run(contract._deliver_message_settle_roulette(
-            MessageSettleRoulette(operator_address=ADMIN, round_id=rid, seed=SEED_FOR_1)))
+            MessageSettleRoulette(operator_address=ADMIN, round_id=rid, seed=SEED_FOR_1),
+            settle_height))
         assert not resp.HasField("error"), resp.error.msg
 
         assert state.balance(PLAYER_A) == 3240  # gross 3600, 10% rake = 360, net 3240
@@ -180,9 +203,11 @@ class TestSettleRouletteHappyPath:
         place_bet(contract, state, PLAYER_A, rid, 100, "red")   # wins 2x = 200
         place_bet(contract, state, PLAYER_B, rid, 100, "black")  # loses
         place_bet(contract, state, PLAYER_C, rid, 100, "black")  # loses
+        settle_height, _ = close_roulette(contract, rid)
 
         resp = run(contract._deliver_message_settle_roulette(
-            MessageSettleRoulette(operator_address=ADMIN, round_id=rid, seed=SEED_FOR_1)))
+            MessageSettleRoulette(operator_address=ADMIN, round_id=rid, seed=SEED_FOR_1),
+            settle_height))
         assert not resp.HasField("error"), resp.error.msg
 
         # pot = 300. Winner A: gross 200, rake 20, net 180.
@@ -199,9 +224,11 @@ class TestSettleRouletteHappyPath:
         place_bet(contract, state, PLAYER_A, rid, 100, "red")
         place_bet(contract, state, PLAYER_B, rid, 100, "black")
         place_bet(contract, state, PLAYER_C, rid, 100, "even")
+        settle_height, _ = close_roulette(contract, rid)
 
         resp = run(contract._deliver_message_settle_roulette(
-            MessageSettleRoulette(operator_address=ADMIN, round_id=rid, seed=SEED_FOR_0)))
+            MessageSettleRoulette(operator_address=ADMIN, round_id=rid, seed=SEED_FOR_0),
+            settle_height))
         assert not resp.HasField("error"), resp.error.msg
 
         assert state.balance(PLAYER_A) == 0
@@ -266,7 +293,9 @@ class TestExpireRoulette:
         assert state.balance(PLAYER_A) == 100
         assert state.balance(PLAYER_B) == 150
         assert state.balance(roulette_escrow_address(rid)) == 0
-        assert state.balance(TREASURY_ADDRESS) == 5350
+        # 5350 released reserves + the slashed 500 operator bond
+        assert state.balance(roulette_bond_address(rid)) == 0
+        assert state.balance(TREASURY_ADDRESS) == 5850
 
     def test_cannot_expire_twice(self, contract, state):
         rid = open_roulette(contract, height=1000)
@@ -282,13 +311,15 @@ class TestExpireRoulette:
     def test_settled_round_cannot_be_expired(self, contract, state):
         rid = open_roulette(contract, rake_bps=0, height=1000, commitment=seed_commitment(SEED_FOR_1))
         place_bet(contract, state, PLAYER_A, rid, 100, "black")  # loses on spin=1 (red)
+        settle_height, _ = close_roulette(contract, rid)
         run(contract._deliver_message_settle_roulette(
-            MessageSettleRoulette(operator_address=ADMIN, round_id=rid, seed=SEED_FOR_1)))
+            MessageSettleRoulette(operator_address=ADMIN, round_id=rid, seed=SEED_FOR_1),
+            settle_height))
 
         with pytest.raises(PluginError, match="not open"):
             run(contract._deliver_message_expire_roulette(
                 MessageExpireRoulette(caller_address=PLAYER_A, round_id=rid),
-                height=1000 + ROOM_EXPIRY_BLOCKS,
+                height=settle_height + ROOM_EXPIRY_BLOCKS + SETTLE_GRACE_BLOCKS,
             ))
 
     def test_unknown_round_rejected(self, contract, state):

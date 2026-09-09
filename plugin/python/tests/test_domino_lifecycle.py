@@ -15,10 +15,14 @@ from contract.contract import (
     Contract,
     ADMIN_ADDRESSES,
     ROOM_EXPIRY_BLOCKS,
+    SETTLE_GRACE_BLOCKS,
     TREASURY_ADDRESS,
     seed_commitment,
     key_for_account,
+    key_for_domino_round,
     domino_escrow_address,
+    domino_bond_address,
+    rng_v2_seed,
     marshal,
     unmarshal,
 )
@@ -39,12 +43,20 @@ from contract.proto.tx_pb2 import (
     MessageSettleDomino,
     MessageExpireDomino,
     DominoMoveRecord,
+    DominoRound,
 )
 from contract.game import domino as gdomino
+from tests.test_room_lifecycle import (
+    OPERATOR_BOND, fund_operator, close_round, entropy_for_close_height,
+)
 
 ADMIN = next(iter(ADMIN_ADDRESSES))
 PLAYER_A = b"p" * 20
 PLAYER_B = b"q" * 20
+
+DEFAULT_RID = b"round001"
+DEFAULT_OPEN_HEIGHT = 1000
+DEFAULT_CLOSE_HEIGHT = DEFAULT_OPEN_HEIGHT + 1
 
 
 class FakeState:
@@ -90,13 +102,19 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def open_domino(contract, round_id=b"round001", entry_fee=100, rake_bps=1000, height=1000,
-                 commitment=b"c" * 32, operator=ADMIN):
+def open_domino(contract, round_id=DEFAULT_RID, entry_fee=100, rake_bps=1000, height=DEFAULT_OPEN_HEIGHT,
+                 commitment=b"c" * 32, operator=ADMIN, operator_bond=OPERATOR_BOND):
+    if operator == ADMIN:
+        fund_operator(contract.plugin, operator_bond)
     msg = MessageOpenDomino(operator_address=operator, round_id=round_id, commitment=commitment,
-                             entry_fee=entry_fee, rake_bps=rake_bps)
+                             entry_fee=entry_fee, rake_bps=rake_bps, operator_bond=operator_bond)
     resp = run(contract._deliver_message_open_domino(msg, height))
     assert not resp.HasField("error"), resp.error.msg
     return round_id
+
+
+def close_domino(contract, round_id=DEFAULT_RID, **kw):
+    return close_round(contract, round_id, key_for_domino_round(round_id), DominoRound, **kw)
 
 
 def join_domino(contract, state, player, round_id, amount):
@@ -169,18 +187,23 @@ def play_out_a_full_game(seed):
     return proto_moves
 
 
-def find_seed_with_result(reason, start=0):
-    for i in range(start, start + 2000):
-        seed = f"dom-seed-{i}".encode().ljust(32, b"\x00")
-        hands, _ = gdomino.deal(seed)
-        moves = play_out_a_full_game(seed)
+def find_seed_with_result(reason, round_id=DEFAULT_RID, close_height=DEFAULT_CLOSE_HEIGHT, start=0):
+    """Brute-force a revealed operator secret such that the fair-randomness-v2
+    replay seed -- SHA256(secret || consensus_entropy || round_id), with the
+    entropy `close_round` fixes for a round closed at `close_height` -- yields a
+    game that ends with `reason`. Returns (secret, move_log, result)."""
+    entropy = entropy_for_close_height(close_height)
+    for i in range(start, start + 20000):
+        secret = f"dom-seed-{i}".encode().ljust(32, b"\x00")
+        final_seed = rng_v2_seed(secret, entropy, round_id)
+        moves = play_out_a_full_game(final_seed)
         py_moves = [gdomino.Move(action=m.action,
                                   tile=(m.tile_low, m.tile_high) if m.action == "play" else None,
                                   end=m.end or None) for m in moves]
-        result = gdomino.replay(seed, py_moves)
+        result = gdomino.replay(final_seed, py_moves)
         if result.reason == reason:
-            return seed, moves, result
-    raise AssertionError(f"no seed found with reason={reason}")
+            return secret, moves, result
+    raise AssertionError(f"no secret found with reason={reason}")
 
 
 SEED_EMPTY, MOVES_EMPTY, RESULT_EMPTY = find_seed_with_result("emptied_hand")
@@ -227,9 +250,11 @@ class TestSettleDominoHappyPath:
         rid = open_domino(contract, entry_fee=100, rake_bps=1000, commitment=seed_commitment(SEED_EMPTY))
         join_domino(contract, state, PLAYER_A, rid, 100)
         join_domino(contract, state, PLAYER_B, rid, 100)
+        settle_height, _ = close_domino(contract, rid)
 
         resp = run(contract._deliver_message_settle_domino(
-            MessageSettleDomino(operator_address=ADMIN, round_id=rid, seed=SEED_EMPTY, moves=MOVES_EMPTY)))
+            MessageSettleDomino(operator_address=ADMIN, round_id=rid, seed=SEED_EMPTY, moves=MOVES_EMPTY),
+            settle_height))
         assert not resp.HasField("error"), resp.error.msg
 
         winner_addr = [PLAYER_A, PLAYER_B][RESULT_EMPTY.winners[0]]
@@ -270,19 +295,24 @@ class TestSettleDominoHappyPath:
         join_domino(contract, state, PLAYER_A, rid, 100)
         join_domino(contract, state, PLAYER_B, rid, 100)
         bogus_moves = [DominoMoveRecord(action="play", tile_low=9, tile_high=9)]  # not a real tile
+        settle_height, _ = close_domino(contract, rid)
         with pytest.raises(PluginError, match="illegal move"):
             run(contract._deliver_message_settle_domino(
-                MessageSettleDomino(operator_address=ADMIN, round_id=rid, seed=SEED_EMPTY, moves=bogus_moves)))
+                MessageSettleDomino(operator_address=ADMIN, round_id=rid, seed=SEED_EMPTY, moves=bogus_moves),
+                settle_height))
 
     def test_cannot_settle_twice(self, contract, state):
         rid = open_domino(contract, commitment=seed_commitment(SEED_EMPTY))
         join_domino(contract, state, PLAYER_A, rid, 100)
         join_domino(contract, state, PLAYER_B, rid, 100)
+        settle_height, _ = close_domino(contract, rid)
         run(contract._deliver_message_settle_domino(
-            MessageSettleDomino(operator_address=ADMIN, round_id=rid, seed=SEED_EMPTY, moves=MOVES_EMPTY)))
+            MessageSettleDomino(operator_address=ADMIN, round_id=rid, seed=SEED_EMPTY, moves=MOVES_EMPTY),
+            settle_height))
         with pytest.raises(PluginError, match="already settled"):
             run(contract._deliver_message_settle_domino(
-                MessageSettleDomino(operator_address=ADMIN, round_id=rid, seed=SEED_EMPTY, moves=MOVES_EMPTY)))
+                MessageSettleDomino(operator_address=ADMIN, round_id=rid, seed=SEED_EMPTY, moves=MOVES_EMPTY),
+                settle_height))
 
 
 class TestExpireDomino:
@@ -340,13 +370,15 @@ class TestExpireDomino:
         rid = open_domino(contract, entry_fee=100, rake_bps=0, height=1000, commitment=seed_commitment(SEED_EMPTY))
         join_domino(contract, state, PLAYER_A, rid, 100)
         join_domino(contract, state, PLAYER_B, rid, 100)
+        settle_height, _ = close_domino(contract, rid)
         run(contract._deliver_message_settle_domino(
-            MessageSettleDomino(operator_address=ADMIN, round_id=rid, seed=SEED_EMPTY, moves=MOVES_EMPTY)))
+            MessageSettleDomino(operator_address=ADMIN, round_id=rid, seed=SEED_EMPTY, moves=MOVES_EMPTY),
+            settle_height))
 
         with pytest.raises(PluginError, match="not open"):
             run(contract._deliver_message_expire_domino(
                 MessageExpireDomino(caller_address=PLAYER_A, round_id=rid),
-                height=1000 + ROOM_EXPIRY_BLOCKS,
+                height=settle_height + ROOM_EXPIRY_BLOCKS + SETTLE_GRACE_BLOCKS,
             ))
 
     def test_unknown_round_rejected(self, contract, state):

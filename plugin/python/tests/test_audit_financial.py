@@ -1,11 +1,15 @@
 import pytest
 from tests.test_room_lifecycle import (
-    FakeState, Contract, Config, open_room, join_room, run, ADMIN,
+    FakeState, Contract, Config, open_room, close_room, join_room, run, ADMIN,
     PLAYER_A, SEED, seed_commitment, MessageJoinRoom, MessageSettleRoom,
     PluginError, escrow_address, MessageExpireRoom,
+    OPERATOR_BOND, fund_operator, entropy_for_close_height, close_round,
 )
+from tests.test_roulette_lifecycle import open_roulette, close_roulette, DEFAULT_CLOSE_HEIGHT
+from tests.test_poker_lifecycle import open_poker, close_poker
+from tests.test_domino_lifecycle import open_domino, close_domino
 from contract.contract import ADMIN_ADDRESSES, ROOM_EXPIRY_BLOCKS, UINT64_MAX
-from contract.contract import TREASURY_ADDRESS, roulette_escrow_address
+from contract.contract import TREASURY_ADDRESS, roulette_escrow_address, rng_v2_seed
 from contract.game.roulette import spin_number
 from contract.proto.tx_pb2 import (
     MessageFaucet, MessageMintCosmetic, MessageOpenRoulette,
@@ -80,45 +84,51 @@ def test_treasury_as_bingo_winner_preserves_rake_and_net():
     state=FakeState(); contract=Contract(config=Config(),plugin=state)
     rid=open_room(contract,commitment=seed_commitment(SEED))
     join_room(contract,state,TREASURY_ADDRESS,rid,100)
-    run(contract._deliver_message_settle_room(MessageSettleRoom(operator_address=ADMIN,round_id=rid,seed=SEED,pattern='line')))
+    settle_height,_=close_room(contract,rid)
+    run(contract._deliver_message_settle_room(MessageSettleRoom(operator_address=ADMIN,round_id=rid,seed=SEED,pattern='line'),settle_height))
     assert state.balance(TREASURY_ADDRESS) == 100
     assert state.balance(escrow_address(rid)) == 0
 
 @pytest.mark.parametrize('bettor', [PLAYER_A,TREASURY_ADDRESS])
 def test_roulette_settlement_conserves_funds_with_treasury_alias(bettor):
-    state=FakeState(); contract=Contract(config=Config(),plugin=state); rid=b'roulette-audit'
+    state=FakeState(); contract=Contract(config=Config(),plugin=state); rid=b'round001'
     state.set_balance(TREASURY_ADDRESS,100000)
     if bettor != TREASURY_ADDRESS: state.set_balance(bettor,100)
     initial=sum(state.balance(a) for a in {bettor,TREASURY_ADDRESS})
-    run(contract._deliver_message_open_roulette(MessageOpenRoulette(operator_address=ADMIN,round_id=rid,commitment=seed_commitment(SEED),rake_bps=1000),1000))
-    run(contract._deliver_message_roulette_bet(MessageRouletteBet(player_address=bettor,round_id=rid,bet_type='straight',bet_number=spin_number(SEED),amount=100)))
-    run(contract._deliver_message_settle_roulette(MessageSettleRoulette(operator_address=ADMIN,round_id=rid,seed=SEED)))
+    open_roulette(contract,round_id=rid,commitment=seed_commitment(SEED))
+    entropy=entropy_for_close_height(DEFAULT_CLOSE_HEIGHT)
+    win_number=spin_number(rng_v2_seed(SEED,entropy,rid))
+    run(contract._deliver_message_roulette_bet(MessageRouletteBet(player_address=bettor,round_id=rid,bet_type='straight',bet_number=win_number,amount=100)))
+    settle_height,_=close_roulette(contract,rid)
+    run(contract._deliver_message_settle_roulette(MessageSettleRoulette(operator_address=ADMIN,round_id=rid,seed=SEED),settle_height))
     assert sum(state.balance(a) for a in {bettor,TREASURY_ADDRESS}) == initial
     assert state.balance(roulette_escrow_address(rid)) == 0
     with pytest.raises(PluginError,match='already settled'):
-        run(contract._deliver_message_settle_roulette(MessageSettleRoulette(operator_address=ADMIN,round_id=rid,seed=SEED)))
+        run(contract._deliver_message_settle_roulette(MessageSettleRoulette(operator_address=ADMIN,round_id=rid,seed=SEED),settle_height))
 
 @pytest.mark.parametrize('treasury_seat',[0,1])
 def test_poker_treasury_participant_preserves_payout_and_rake(treasury_seat):
-    state=FakeState(); contract=Contract(config=Config(),plugin=state); rid=b'poker-audit'
+    state=FakeState(); contract=Contract(config=Config(),plugin=state); rid=b'round001'
     players=[PLAYER_A,PLAYER_A]; players[treasury_seat]=TREASURY_ADDRESS
-    run(contract._deliver_message_open_poker(MessageOpenPoker(operator_address=ADMIN,round_id=rid,commitment=seed_commitment(SEED),small_blind=10,big_blind=20,buy_in=1000,rake_bps=1000),1000))
+    open_poker(contract,round_id=rid,commitment=seed_commitment(SEED))
     for player in players:
         state.set_balance(player,1000)
         run(contract._deliver_message_join_poker(MessageJoinPoker(player_address=player,round_id=rid,amount=1000)))
-    run(contract._deliver_message_settle_poker(MessageSettlePoker(operator_address=ADMIN,round_id=rid,seed=SEED,actions=[PokerActionRecord(action='fold')])))
+    settle_height,_=close_poker(contract,rid)
+    run(contract._deliver_message_settle_poker(MessageSettlePoker(operator_address=ADMIN,round_id=rid,seed=SEED,actions=[PokerActionRecord(action='fold')]),settle_height))
     assert sum(state.balance(a) for a in players) == 2000
     assert state.balance(poker_escrow_address(rid)) == 0
 
 @pytest.mark.parametrize('treasury_seat',[0,1])
 def test_domino_treasury_participant_preserves_payout_and_rake(treasury_seat):
-    state=FakeState(); contract=Contract(config=Config(),plugin=state); rid=b'domino-audit'
+    state=FakeState(); contract=Contract(config=Config(),plugin=state); rid=b'round001'
     players=[PLAYER_A,PLAYER_A]; players[treasury_seat]=TREASURY_ADDRESS
-    run(contract._deliver_message_open_domino(MessageOpenDomino(operator_address=ADMIN,round_id=rid,commitment=seed_commitment(SEED),entry_fee=100,rake_bps=1000),1000))
+    open_domino(contract,round_id=rid,commitment=seed_commitment(SEED))
     for player in players:
         state.set_balance(player,100)
         run(contract._deliver_message_join_domino(MessageJoinDomino(player_address=player,round_id=rid,amount=100)))
-    engine=GameEngine(SEED); moves=[]
+    final_seed=rng_v2_seed(SEED,entropy_for_close_height(DEFAULT_CLOSE_HEIGHT),rid)
+    engine=GameEngine(final_seed); moves=[]
     while not engine.finished:
         hand=engine.hands[engine.turn]; move=None
         if engine.ends is None: move=Move(action='play',tile=hand[0])
@@ -130,6 +140,7 @@ def test_domino_treasury_participant_preserves_payout_and_rake(treasury_seat):
         engine.apply_move(move)
         moves.append(DominoMoveRecord(action=move.action,tile_low=move.tile[0] if move.tile else 0,tile_high=move.tile[1] if move.tile else 0,end=move.end or ''))
         assert len(moves) < 200
-    run(contract._deliver_message_settle_domino(MessageSettleDomino(operator_address=ADMIN,round_id=rid,seed=SEED,moves=moves)))
+    settle_height,_=close_domino(contract,rid)
+    run(contract._deliver_message_settle_domino(MessageSettleDomino(operator_address=ADMIN,round_id=rid,seed=SEED,moves=moves),settle_height))
     assert sum(state.balance(a) for a in players) == 200
     assert state.balance(domino_escrow_address(rid)) == 0
