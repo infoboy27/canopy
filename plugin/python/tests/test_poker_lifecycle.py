@@ -16,10 +16,14 @@ from contract.contract import (
     Contract,
     ADMIN_ADDRESSES,
     ROOM_EXPIRY_BLOCKS,
+    SETTLE_GRACE_BLOCKS,
     TREASURY_ADDRESS,
     seed_commitment,
     key_for_account,
+    key_for_poker_round,
     poker_escrow_address,
+    poker_bond_address,
+    rng_v2_seed,
     marshal,
     unmarshal,
 )
@@ -40,12 +44,20 @@ from contract.proto.tx_pb2 import (
     MessageSettlePoker,
     MessageExpirePoker,
     PokerActionRecord,
+    PokerRound,
 )
 from contract.game import poker as gpoker
+from tests.test_room_lifecycle import (
+    OPERATOR_BOND, fund_operator, close_round, entropy_for_close_height,
+)
 
 ADMIN = next(iter(ADMIN_ADDRESSES))
 PLAYER_A = b"p" * 20
 PLAYER_B = b"q" * 20
+
+DEFAULT_RID = b"round001"
+DEFAULT_OPEN_HEIGHT = 1000
+DEFAULT_CLOSE_HEIGHT = DEFAULT_OPEN_HEIGHT + 1
 
 SMALL_BLIND = 10
 BIG_BLIND = 20
@@ -93,16 +105,24 @@ def contract(state):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
-def open_poker(contract, round_id=b"round001", small_blind=SMALL_BLIND, big_blind=BIG_BLIND,
-               buy_in=BUY_IN, rake_bps=RAKE_BPS, height=1000, commitment=b"c" * 32, operator=ADMIN):
+def open_poker(contract, round_id=DEFAULT_RID, small_blind=SMALL_BLIND, big_blind=BIG_BLIND,
+               buy_in=BUY_IN, rake_bps=RAKE_BPS, height=DEFAULT_OPEN_HEIGHT, commitment=b"c" * 32,
+               operator=ADMIN, operator_bond=OPERATOR_BOND):
+    if operator == ADMIN:
+        fund_operator(contract.plugin, operator_bond)
     msg = MessageOpenPoker(operator_address=operator, round_id=round_id, commitment=commitment,
-                           small_blind=small_blind, big_blind=big_blind, buy_in=buy_in, rake_bps=rake_bps)
+                           small_blind=small_blind, big_blind=big_blind, buy_in=buy_in, rake_bps=rake_bps,
+                           operator_bond=operator_bond)
     resp = run(contract._deliver_message_open_poker(msg, height))
     assert not resp.HasField("error"), resp.error.msg
     return round_id
+
+
+def close_poker(contract, round_id=DEFAULT_RID, **kw):
+    return close_round(contract, round_id, key_for_poker_round(round_id), PokerRound, **kw)
 
 
 def join_poker(contract, state, player, round_id, amount):
@@ -116,14 +136,19 @@ def actions_to_proto(actions):
     return [PokerActionRecord(action=a.action, amount=a.amount) for a in actions]
 
 
+# The plugin replays from SHA256(revealed_secret || consensus_entropy || round_id),
+# so the deal a test must reason about is the one the FINAL seed produces.
+_ENTROPY = entropy_for_close_height(DEFAULT_CLOSE_HEIGHT)
 SEED_CHECKDOWN = b"s" * 32
+FINAL_CHECKDOWN = rng_v2_seed(SEED_CHECKDOWN, _ENTROPY, DEFAULT_RID)
 CHECKDOWN_ACTIONS = [gpoker.PokerAction("check_call")] * 8
-RESULT_CHECKDOWN = gpoker.replay(SEED_CHECKDOWN, SMALL_BLIND, BIG_BLIND, (BUY_IN, BUY_IN), CHECKDOWN_ACTIONS)
+RESULT_CHECKDOWN = gpoker.replay(FINAL_CHECKDOWN, SMALL_BLIND, BIG_BLIND, (BUY_IN, BUY_IN), CHECKDOWN_ACTIONS)
 PROTO_CHECKDOWN_ACTIONS = actions_to_proto(CHECKDOWN_ACTIONS)
 
 SEED_FOLD = b"f" * 32
+FINAL_FOLD = rng_v2_seed(SEED_FOLD, _ENTROPY, DEFAULT_RID)
 FOLD_ACTIONS = [gpoker.PokerAction("fold")]
-RESULT_FOLD = gpoker.replay(SEED_FOLD, SMALL_BLIND, BIG_BLIND, (BUY_IN, BUY_IN), FOLD_ACTIONS)
+RESULT_FOLD = gpoker.replay(FINAL_FOLD, SMALL_BLIND, BIG_BLIND, (BUY_IN, BUY_IN), FOLD_ACTIONS)
 PROTO_FOLD_ACTIONS = actions_to_proto(FOLD_ACTIONS)
 
 
@@ -168,10 +193,11 @@ class TestSettlePokerHappyPath:
         rid = open_poker(contract, commitment=seed_commitment(SEED_CHECKDOWN))
         join_poker(contract, state, PLAYER_A, rid, BUY_IN)
         join_poker(contract, state, PLAYER_B, rid, BUY_IN)
+        settle_height, _ = close_poker(contract, rid)
 
         resp = run(contract._deliver_message_settle_poker(
             MessageSettlePoker(operator_address=ADMIN, round_id=rid, seed=SEED_CHECKDOWN,
-                               actions=PROTO_CHECKDOWN_ACTIONS)))
+                               actions=PROTO_CHECKDOWN_ACTIONS), settle_height))
         assert not resp.HasField("error"), resp.error.msg
 
         winner_slot = RESULT_CHECKDOWN.winners[0]
@@ -188,10 +214,11 @@ class TestSettlePokerHappyPath:
         rid = open_poker(contract, commitment=seed_commitment(SEED_FOLD))
         join_poker(contract, state, PLAYER_A, rid, BUY_IN)
         join_poker(contract, state, PLAYER_B, rid, BUY_IN)
+        settle_height, _ = close_poker(contract, rid)
 
         resp = run(contract._deliver_message_settle_poker(
             MessageSettlePoker(operator_address=ADMIN, round_id=rid, seed=SEED_FOLD,
-                               actions=PROTO_FOLD_ACTIONS)))
+                               actions=PROTO_FOLD_ACTIONS), settle_height))
         assert not resp.HasField("error"), resp.error.msg
 
         winner_slot = RESULT_FOLD.winners[0]
@@ -238,22 +265,24 @@ class TestSettlePokerHappyPath:
         join_poker(contract, state, PLAYER_B, rid, BUY_IN)
         # a raise-to of only BB+1 as the very first action -- below the legal minimum
         bogus_actions = [PokerActionRecord(action="bet_raise", amount=BIG_BLIND + 1)]
+        settle_height, _ = close_poker(contract, rid)
         with pytest.raises(PluginError, match="illegal action"):
             run(contract._deliver_message_settle_poker(
                 MessageSettlePoker(operator_address=ADMIN, round_id=rid, seed=SEED_CHECKDOWN,
-                                   actions=bogus_actions)))
+                                   actions=bogus_actions), settle_height))
 
     def test_cannot_settle_twice(self, contract, state):
         rid = open_poker(contract, commitment=seed_commitment(SEED_CHECKDOWN))
         join_poker(contract, state, PLAYER_A, rid, BUY_IN)
         join_poker(contract, state, PLAYER_B, rid, BUY_IN)
+        settle_height, _ = close_poker(contract, rid)
         run(contract._deliver_message_settle_poker(
             MessageSettlePoker(operator_address=ADMIN, round_id=rid, seed=SEED_CHECKDOWN,
-                               actions=PROTO_CHECKDOWN_ACTIONS)))
+                               actions=PROTO_CHECKDOWN_ACTIONS), settle_height))
         with pytest.raises(PluginError, match="already settled"):
             run(contract._deliver_message_settle_poker(
                 MessageSettlePoker(operator_address=ADMIN, round_id=rid, seed=SEED_CHECKDOWN,
-                                   actions=PROTO_CHECKDOWN_ACTIONS)))
+                                   actions=PROTO_CHECKDOWN_ACTIONS), settle_height))
 
 
 class TestExpirePoker:
@@ -311,14 +340,15 @@ class TestExpirePoker:
         rid = open_poker(contract, rake_bps=0, height=1000, commitment=seed_commitment(SEED_CHECKDOWN))
         join_poker(contract, state, PLAYER_A, rid, BUY_IN)
         join_poker(contract, state, PLAYER_B, rid, BUY_IN)
+        settle_height, _ = close_poker(contract, rid)
         run(contract._deliver_message_settle_poker(
             MessageSettlePoker(operator_address=ADMIN, round_id=rid, seed=SEED_CHECKDOWN,
-                               actions=PROTO_CHECKDOWN_ACTIONS)))
+                               actions=PROTO_CHECKDOWN_ACTIONS), settle_height))
 
         with pytest.raises(PluginError, match="not open"):
             run(contract._deliver_message_expire_poker(
                 MessageExpirePoker(caller_address=PLAYER_A, round_id=rid),
-                height=1000 + ROOM_EXPIRY_BLOCKS,
+                height=settle_height + ROOM_EXPIRY_BLOCKS + SETTLE_GRACE_BLOCKS,
             ))
 
     def test_unknown_round_rejected(self, contract, state):

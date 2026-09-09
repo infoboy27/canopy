@@ -161,7 +161,7 @@ func (s *StateMachine) ApplyBlock(ctx context.Context, b *lib.Block, allowOversi
 	}
 	// automated execution at the 'beginning of a block'
 	beginBlockStartTime := time.Now()
-	events, err := s.BeginBlock()
+	events, err := s.BeginBlock(b.BlockHeader.LastBlockHash)
 	if err != nil {
 		return nil, nil, err
 	}

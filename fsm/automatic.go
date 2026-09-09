@@ -7,15 +7,47 @@ import (
 
 /* This file handles 'automatic' (non-transaction-induced) state changes that occur at the beginning and ending of a block */
 
-// BeginBlock() is code that is executed at the start of `applying` the block
-func (s *StateMachine) BeginBlock() (lib.Events, lib.ErrorI) {
+// BeginBlock() is code that is executed at the start of `applying` the block.
+// lastBlockHash is the consensus-verified hash of the predecessor block, taken
+// from the applying block's header (empty only at height 1). It is forwarded to
+// the plugin verbatim as unpredictable, consensus-authenticated entropy: the
+// plugin must never accept an operator- or RPC-supplied substitute.
+func (s *StateMachine) BeginBlock(lastBlockHash []byte) (lib.Events, lib.ErrorI) {
 	if s.Metrics != nil {
 		s.Metrics.RestrictedTxCount.Set(0)
 	}
 	s.events.Refer(lib.EventStageBeginBlock)
+	// Both entropy inputs the plugin folds -- the predecessor hash and the
+	// predecessor's consensus VDF output -- are resolved from the FSM's own
+	// committed index. That makes them identical for the proposer's block
+	// simulation (which runs against a skeletal header carrying neither) and
+	// for every validator applying the finished block, so folding them into
+	// plugin state stays deterministic.
+	//
+	// The VDF is deliberately taken from block height-1's header (its own VDF,
+	// computed over the block before it), never from the applying header: the
+	// applying header's VDF is over lastBlockHash and is not yet known when the
+	// proposer computes the state root. The predecessor hash still prefers a
+	// non-empty applying-header value so a malformed one is rejected by the
+	// plugin rather than silently replaced.
+	var vdfOutput []byte
+	if s.height > 1 {
+		lastBlock, err := s.LoadBlock(s.height - 1)
+		if err != nil {
+			return nil, err
+		}
+		if len(lastBlockHash) == 0 {
+			lastBlockHash = lastBlock.BlockHeader.Hash
+		}
+		vdfOutput = lastBlock.BlockHeader.GetVdf().GetOutput()
+	}
 	// execute plugin begin block if enabled
 	if s.Plugin != nil {
-		resp, err := s.Plugin.BeginBlock(s, &lib.PluginBeginRequest{Height: s.height})
+		resp, err := s.Plugin.BeginBlock(s, &lib.PluginBeginRequest{
+			Height:        s.height,
+			LastBlockHash: lastBlockHash,
+			VdfOutput:     vdfOutput,
+		})
 		if err != nil {
 			return nil, err
 		}

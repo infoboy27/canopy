@@ -110,6 +110,15 @@ message MessageOpenRoom {
   uint64 entry_fee = 4;       // @gotags: json:"entryFee" base entry (uCNPY) for 1 card
   uint64 rake_bps = 5;        // @gotags: json:"rakeBps"
   repeated uint64 payout_weights_bps = 6; // @gotags: json:"payoutWeightsBps"
+  uint64 operator_bond = 7;   // @gotags: json:"operatorBond" -- fair-randomness-v2: operator escrows this at open; returned on settle, slashed to treasury on expire
+}
+
+// MessageCloseRoom stops entries for a round and fixes the consensus-entropy
+// window (fair-randomness-v2 A.4). Bets close BEFORE any block in the window
+// exists, so the operator can neither predict nor grind the outcome.
+message MessageCloseRoom {
+  bytes operator_address = 1; // @gotags: json:"operatorAddress"
+  bytes round_id = 2;         // @gotags: json:"roundID"
 }
 
 // MessageJoinRoom escrows a player entry into an open round.
@@ -149,11 +158,15 @@ message RoomRound {
   uint64 rake_bps = 5;        // @gotags: json:"rakeBps"
   uint64 escrow_total = 6;    // @gotags: json:"escrowTotal"
   uint64 num_players = 7;     // @gotags: json:"numPlayers"
-  uint32 status = 8;          // 0 = open, 1 = settled, 2 = expired (refunded)
+  uint32 status = 8;          // 0 = open, 1 = settled, 2 = expired (refunded), 3 = closed (entropy window fixed, awaiting settle)
   repeated bytes participant_addresses = 9;   // @gotags: json:"participantAddresses"
   repeated uint64 participant_num_cards = 10;  // @gotags: json:"participantNumCards"
   repeated uint64 payout_weights_bps = 11;     // @gotags: json:"payoutWeightsBps"
   uint64 opened_height = 12;  // @gotags: json:"openedHeight" -- block height MessageOpenRoom landed at; the expiry deadline for MessageExpireRoom
+  uint64 operator_bond = 13;  // @gotags: json:"operatorBond" -- amount the operator escrowed at open (fair-randomness-v2)
+  uint64 close_height = 14;   // @gotags: json:"closeHeight" -- block MessageCloseRoom landed at; 0 while still open
+  uint64 entropy_start = 15;  // @gotags: json:"entropyStart" -- first finalized block height folded into the settle entropy
+  uint64 entropy_end = 16;    // @gotags: json:"entropyEnd" -- last finalized block height folded into the settle entropy
 }
 
 // RoomParticipant records one player entry in a round.
@@ -230,6 +243,14 @@ message MessageOpenRoulette {
   bytes round_id = 2;         // @gotags: json:"roundID"
   bytes commitment = 3;       // sha256(seed), revealed at settle
   uint64 rake_bps = 4;        // @gotags: json:"rakeBps"
+  uint64 operator_bond = 5;   // @gotags: json:"operatorBond" -- fair-randomness-v2: escrowed at open, returned on settle, slashed on expire
+}
+
+// MessageCloseRoulette stops bets and fixes the consensus-entropy window
+// (fair-randomness-v2 A.4).
+message MessageCloseRoulette {
+  bytes operator_address = 1; // @gotags: json:"operatorAddress"
+  bytes round_id = 2;         // @gotags: json:"roundID"
 }
 
 // MessageRouletteBet escrows one bet into an open round. One bet per address
@@ -264,11 +285,15 @@ message RouletteRound {
   bytes commitment = 3;
   uint64 rake_bps = 4;        // @gotags: json:"rakeBps"
   uint64 pot_total = 5;       // @gotags: json:"potTotal"
-  uint32 status = 6;          // 0 = open, 1 = settled, 2 = expired (refunded)
+  uint32 status = 6;          // 0 = open, 1 = settled, 2 = expired (refunded), 3 = closed (entropy window fixed, awaiting settle)
   repeated bytes bettor_addresses = 7; // @gotags: json:"bettorAddresses"
   uint64 opened_height = 8;   // @gotags: json:"openedHeight"
   bytes seed = 9;             // revealed seed, empty until settled
   uint32 spin = 10;           // winning number 0-36, only meaningful once settled
+  uint64 operator_bond = 11;  // @gotags: json:"operatorBond"
+  uint64 close_height = 12;   // @gotags: json:"closeHeight"
+  uint64 entropy_start = 13;  // @gotags: json:"entropyStart"
+  uint64 entropy_end = 14;    // @gotags: json:"entropyEnd"
 }
 
 // RouletteBetRecord records one player's escrowed bet in a round.
@@ -296,6 +321,14 @@ message MessageOpenDomino {
   bytes commitment = 3;       // sha256(seed), revealed at settle
   uint64 entry_fee = 4;       // @gotags: json:entryFee -- each of the 2 players escrows exactly this amount
   uint64 rake_bps = 5;        // @gotags: json:rakeBps
+  uint64 operator_bond = 6;   // @gotags: json:operatorBond -- fair-randomness-v2: escrowed at open, returned on settle, slashed on expire
+}
+
+// MessageCloseDomino stops joins and fixes the consensus-entropy window
+// (fair-randomness-v2 A.4).
+message MessageCloseDomino {
+  bytes operator_address = 1; // @gotags: json:operatorAddress
+  bytes round_id = 2;         // @gotags: json:roundID
 }
 
 // MessageJoinDomino escrows one player's entry fee into an open round.
@@ -338,12 +371,16 @@ message DominoRound {
   uint64 entry_fee = 4;                      // @gotags: json:entryFee
   uint64 rake_bps = 5;                       // @gotags: json:rakeBps
   uint64 escrow_total = 6;                   // @gotags: json:escrowTotal
-  uint32 status = 7;                         // 0 = open, 1 = settled, 2 = expired (refunded)
+  uint32 status = 7;                         // 0 = open, 1 = settled, 2 = expired (refunded), 3 = closed (entropy window fixed, awaiting settle)
   repeated bytes participant_addresses = 8;  // @gotags: json:participantAddresses -- join order = player slot
   uint64 opened_height = 9;                  // @gotags: json:openedHeight
   bytes seed = 10;                           // revealed seed, empty until settled
   repeated uint32 winner_slots = 11;          // @gotags: json:winnerSlots -- >1 entry only on a tied block
   string result_reason = 12;                 // @gotags: json:resultReason -- emptied_hand | blocked
+  uint64 operator_bond = 13;                 // @gotags: json:operatorBond
+  uint64 close_height = 14;                  // @gotags: json:closeHeight
+  uint64 entropy_start = 15;                 // @gotags: json:entropyStart
+  uint64 entropy_end = 16;                   // @gotags: json:entropyEnd
 }
 
 // -- Poker: heads-up (2-player) No-Limit Texas Hold'em, fixed blinds --
@@ -362,6 +399,14 @@ message MessageOpenPoker {
   uint64 big_blind = 5;       // @gotags: json:bigBlind
   uint64 buy_in = 6;          // @gotags: json:buyIn -- each of the 2 players escrows exactly this amount
   uint64 rake_bps = 7;        // @gotags: json:rakeBps
+  uint64 operator_bond = 8;   // @gotags: json:operatorBond -- fair-randomness-v2: escrowed at open, returned on settle, slashed on expire
+}
+
+// MessageClosePoker stops joins and fixes the consensus-entropy window
+// (fair-randomness-v2 A.4).
+message MessageClosePoker {
+  bytes operator_address = 1; // @gotags: json:operatorAddress
+  bytes round_id = 2;         // @gotags: json:roundID
 }
 
 // MessageJoinPoker escrows one player's buy-in into an open round.
@@ -406,10 +451,14 @@ message PokerRound {
   uint64 buy_in = 6;                         // @gotags: json:buyIn
   uint64 rake_bps = 7;                       // @gotags: json:rakeBps
   uint64 escrow_total = 8;                   // @gotags: json:escrowTotal
-  uint32 status = 9;                         // 0 = open, 1 = settled, 2 = expired (refunded)
+  uint32 status = 9;                         // 0 = open, 1 = settled, 2 = expired (refunded), 3 = closed (entropy window fixed, awaiting settle)
   repeated bytes participant_addresses = 10; // @gotags: json:participantAddresses -- join order: 0=dealer/SB, 1=BB
   uint64 opened_height = 11;                 // @gotags: json:openedHeight
   bytes seed = 12;                           // revealed seed, empty until settled
   repeated uint32 winner_slots = 13;          // @gotags: json:winnerSlots
   string result_reason = 14;                 // @gotags: json:resultReason -- fold | showdown
+  uint64 operator_bond = 15;                 // @gotags: json:operatorBond
+  uint64 close_height = 16;                  // @gotags: json:closeHeight
+  uint64 entropy_start = 17;                 // @gotags: json:entropyStart
+  uint64 entropy_end = 18;                   // @gotags: json:entropyEnd
 }
