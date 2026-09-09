@@ -17,6 +17,18 @@ func (s *StateMachine) BeginBlock(lastBlockHash []byte) (lib.Events, lib.ErrorI)
 		s.Metrics.RestrictedTxCount.Set(0)
 	}
 	s.events.Refer(lib.EventStageBeginBlock)
+	// Proposal simulation starts from a skeletal header; unlike validation and
+	// commit, it does not yet carry LastBlockHash. Resolve that one empty case
+	// from the FSM's indexed predecessor so the plugin still receives only
+	// consensus-authenticated entropy. A non-empty malformed header is preserved
+	// and rejected by the plugin rather than silently replaced.
+	if s.height > 1 && len(lastBlockHash) == 0 {
+		lastBlock, err := s.LoadBlock(s.height - 1)
+		if err != nil {
+			return nil, err
+		}
+		lastBlockHash = lastBlock.BlockHeader.Hash
+	}
 	// execute plugin begin block if enabled
 	if s.Plugin != nil {
 		resp, err := s.Plugin.BeginBlock(s, &lib.PluginBeginRequest{

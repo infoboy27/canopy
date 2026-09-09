@@ -113,6 +113,16 @@ func TestBeginBlock(t *testing.T) {
 				}
 				require.NoError(t, sm.store.(lib.StoreI).IndexQC(qc))
 			}
+			// Proposal construction invokes BeginBlock with a skeletal header. Its
+			// predecessor must therefore already be available in the FSM index.
+			if !test.isGenesis {
+				require.NoError(t, sm.store.(lib.StoreI).IndexBlock(&lib.BlockResult{
+					BlockHeader: &lib.BlockHeader{
+						Height: sm.height,
+						Hash:   crypto.Hash([]byte("indexed predecessor")),
+					},
+				}))
+			}
 			// commit the store
 			_, err := sm.store.(lib.StoreI).Commit()
 			require.NoError(t, err)
