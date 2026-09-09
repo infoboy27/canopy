@@ -5,6 +5,7 @@ This file contains the base contract implementation that handles the 'send' tran
 Matches Go's contract/contract.go structure.
 """
 
+import os
 import random
 import struct
 import hashlib
@@ -120,6 +121,17 @@ ENTROPY_DELAY_BLOCKS = 8
 ENTROPY_WINDOW_BLOCKS = 8
 # blocks after entropy_end before MessageExpire* can refund an unsettled round.
 SETTLE_GRACE_BLOCKS = 720
+
+# VDF hardening. The FSM folds each predecessor block's consensus VDF output
+# (over the block before it) into that block's ledger entry alongside its hash,
+# so a full-window grind needs an unbroken proposer run AND beating an honest
+# non-parallelizable delay. When this is set, settle fails closed unless every
+# block in a round's window carried a VDF output. It is off by default because
+# the valueless testnet runs sub-second consensus phases that leave no time for
+# a VDF; real-money deployments set CANASINO_REQUIRE_CONSENSUS_VDF=1. Tests
+# override the module attribute directly.
+REQUIRE_CONSENSUS_VDF = os.environ.get(
+    "CANASINO_REQUIRE_CONSENSUS_VDF", "").strip().lower() in ("1", "true", "yes")
 
 
 # Plugin configuration (matching Go's ContractConfig)
@@ -363,8 +375,10 @@ def key_for_consensus_entropy(height: int) -> bytes:
 
 
 def encode_consensus_entropy(last_block_hash: bytes, vdf_output: bytes) -> bytes:
-    """Ledger value: the 32-byte predecessor hash followed by the (currently
-    empty) VDF output. Fixed 32-byte hash prefix means no separator is needed."""
+    """Ledger value: the 32-byte predecessor hash followed by that block's
+    consensus VDF output (empty when the block carried no VDF). The fixed
+    32-byte hash prefix means no separator is needed, and `len == 32` reads as
+    "hash only, no VDF"."""
     return bytes(last_block_hash) + bytes(vdf_output)
 
 
@@ -441,13 +455,15 @@ class Contract:
         return PluginGenesisResponse()
 
     async def begin_block(self, request: PluginBeginRequest) -> PluginBeginResponse:
-        """Persist the FSM-authenticated predecessor block hash as the entropy
-        ledger entry for height-1 (see audit/specs/fair-randomness-v2.md A.3).
+        """Persist the FSM-authenticated predecessor entropy -- block H-1's hash
+        and its consensus VDF output (empty when that block carried no VDF) --
+        as the ledger entry for height-1 (see audit/specs/fair-randomness-v2.md
+        A.2/A.3). Both come from the FSM's committed index, so the value is
+        identical for the proposer's simulation and every validator.
 
-        At block H the hash belongs to committed block H-1. Height 0 is a
-        harmless unit-test/default request and height 1 has no predecessor. A
-        post-upgrade FSM that omits or corrupts the hash fails closed so a
-        settle can never consume unauthenticated entropy.
+        Height 0 is a harmless unit-test/default request and height 1 has no
+        predecessor. A post-upgrade FSM that omits or corrupts the hash fails
+        closed so a settle can never consume unauthenticated entropy.
         """
         response = PluginBeginResponse()
         try:
@@ -488,7 +504,9 @@ class Contract:
         """Read heights [entropy_start, entropy_end] from the entropy ledger and
         fold them into one 32-byte value. Returns (entropy, None) on success or
         (None, PluginError) if any block in the window is missing -- settle then
-        fails closed rather than guessing.
+        fails closed rather than guessing. When `REQUIRE_CONSENSUS_VDF` is set,
+        a window block whose ledger entry is hash-only (no VDF output) is also
+        treated as unavailable.
 
         The window is small (ENTROPY_WINDOW_BLOCKS), so this is a plain
         multi-key read; no range scan needed.
@@ -514,6 +532,11 @@ class Contract:
                 return None, PluginError(
                     1, "canasino",
                     f"consensus entropy for height {h} is not available",
+                )
+            if REQUIRE_CONSENSUS_VDF and len(v) == 32:
+                return None, PluginError(
+                    1, "canasino",
+                    f"consensus VDF for height {h} is not available",
                 )
             window.append(v)
         return fold_consensus_entropy(window), None

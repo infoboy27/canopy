@@ -10,6 +10,7 @@ in-memory fake plugin and independently recompute the seed and the outcome.
 
 import pytest
 
+import contract.contract as contract_mod
 from contract.contract import (
     Contract, ADMIN_ADDRESSES, TREASURY_ADDRESS,
     ENTROPY_DELAY_BLOCKS, ENTROPY_WINDOW_BLOCKS, SETTLE_GRACE_BLOCKS,
@@ -46,22 +47,24 @@ def contract(state):
     return Contract(config=Config(), plugin=state)
 
 
-def _begin_block(contract, height, block_hash):
+def _begin_block(contract, height, block_hash, vdf=b""):
     """Drive the real begin_block so the entropy ledger is populated exactly the
     way a running chain would, rather than writing ledger keys by hand."""
-    resp = run(contract.begin_block(
-        PluginBeginRequest(height=height, last_block_hash=block_hash)))
+    resp = run(contract.begin_block(PluginBeginRequest(
+        height=height, last_block_hash=block_hash, vdf_output=vdf)))
     assert not resp.HasField("error"), resp.error.msg
 
 
-def _run_blocks(contract, lo, hi):
-    """begin_block for every height in [lo, hi]; returns {predecessor_height: hash}."""
-    hashes = {}
+def _run_blocks(contract, lo, hi, with_vdf=False):
+    """begin_block for every height in [lo, hi]; returns
+    {predecessor_height: ledger_value}."""
+    values = {}
     for h in range(lo, hi + 1):
         bh = derive_seed(b"block", h.to_bytes(8, "big"))
-        _begin_block(contract, h, bh)
-        hashes[h - 1] = bh
-    return hashes
+        vdf = derive_seed(b"vdf", h.to_bytes(8, "big"))[:24] if with_vdf else b""
+        _begin_block(contract, h, bh, vdf)
+        values[h - 1] = bh + vdf
+    return values
 
 
 def _open(contract, state, *, entry_fee=100, rake_bps=1000, bond=500, height=1000):
@@ -246,3 +249,78 @@ def test_unsettled_closed_round_slashes_bond_on_expire(contract, state):
     assert state.balance(bingo_bond_address(RID)) == 0
     assert state.balance(TREASURY_ADDRESS) == 500  # bond slashed to the house
     assert state.balance(ADMIN) == 9_500           # operator is out the bond
+
+
+# -- VDF hardening (audit/specs/fair-randomness-v2.md A.2) --------------------
+
+@pytest.fixture
+def require_vdf():
+    """Flip the module gate for the duration of one test."""
+    prev = contract_mod.REQUIRE_CONSENSUS_VDF
+    contract_mod.REQUIRE_CONSENSUS_VDF = True
+    try:
+        yield
+    finally:
+        contract_mod.REQUIRE_CONSENSUS_VDF = prev
+
+
+def test_begin_block_persists_hash_and_vdf(contract, state):
+    _begin_block(contract, 50, b"h" * 32, b"v" * 24)
+    assert state.kv[key_for_consensus_entropy(49)] == b"h" * 32 + b"v" * 24
+
+
+def test_vdf_output_is_folded_into_the_entropy(contract, state):
+    _open(contract, state, height=1000)
+    _join(contract, state, PLAYER_A, 100)
+    rr = _close(contract, height=1000)
+    values = _run_blocks(contract, rr.close_height + 1, rr.entropy_end + 1, with_vdf=True)
+
+    resp = run(contract._deliver_message_settle_room(
+        MessageSettleRoom(operator_address=ADMIN, round_id=RID, seed=SECRET,
+                          pattern="line"), rr.entropy_end + 1))
+    assert not resp.HasField("error"), resp.error.msg
+
+    window = [values[h] for h in range(rr.entropy_start, rr.entropy_end + 1)]
+    with_vdf_seed = rng_v2_seed(SECRET, fold_consensus_entropy(window), RID)
+    hash_only_seed = rng_v2_seed(
+        SECRET, fold_consensus_entropy([v[:32] for v in window]), RID)
+    assert with_vdf_seed != hash_only_seed  # the VDF term actually changed the fold
+    assert state.balance(PLAYER_A) == 90    # payout is consistent with a clean settle
+
+
+def test_require_vdf_fails_closed_on_a_hash_only_window(contract, state, require_vdf):
+    _open(contract, state, height=1000)
+    _join(contract, state, PLAYER_A, 100)
+    rr = _close(contract, height=1000)
+    _run_blocks(contract, rr.close_height + 1, rr.entropy_end + 1, with_vdf=False)
+    with pytest.raises(PluginError, match="consensus VDF for height .* is not available"):
+        run(contract._deliver_message_settle_room(
+            MessageSettleRoom(operator_address=ADMIN, round_id=RID, seed=SECRET,
+                              pattern="line"), rr.entropy_end + 1))
+
+
+def test_require_vdf_settles_when_every_window_block_has_a_vdf(contract, state, require_vdf):
+    _open(contract, state, entry_fee=100, rake_bps=1000, bond=500, height=1000)
+    _join(contract, state, PLAYER_A, 100)
+    rr = _close(contract, height=1000)
+    _run_blocks(contract, rr.close_height + 1, rr.entropy_end + 1, with_vdf=True)
+    resp = run(contract._deliver_message_settle_room(
+        MessageSettleRoom(operator_address=ADMIN, round_id=RID, seed=SECRET,
+                          pattern="line"), rr.entropy_end + 1))
+    assert not resp.HasField("error"), resp.error.msg
+    assert state.balance(PLAYER_A) == 90
+
+
+def test_require_vdf_fails_closed_when_one_window_block_lacks_a_vdf(contract, state, require_vdf):
+    _open(contract, state, height=1000)
+    _join(contract, state, PLAYER_A, 100)
+    rr = _close(contract, height=1000)
+    for h in range(rr.close_height + 1, rr.entropy_end + 2):
+        bh = derive_seed(b"block", h.to_bytes(8, "big"))
+        # the block that finalizes entropy_start+2 carried no VDF
+        vdf = b"" if (h - 1) == rr.entropy_start + 2 else derive_seed(b"vdf", h.to_bytes(8, "big"))[:24]
+        _begin_block(contract, h, bh, vdf)
+    with pytest.raises(PluginError, match="consensus VDF for height"):
+        run(contract._deliver_message_settle_room(
+            MessageSettleRoom(operator_address=ADMIN, round_id=RID, seed=SECRET,
+                              pattern="line"), rr.entropy_end + 1))

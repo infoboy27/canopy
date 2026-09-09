@@ -113,8 +113,9 @@ func TestBeginBlock(t *testing.T) {
 				}
 				require.NoError(t, sm.store.(lib.StoreI).IndexQC(qc))
 			}
-			// Proposal construction invokes BeginBlock with a skeletal header. Its
-			// predecessor must therefore already be available in the FSM index.
+			// BeginBlock resolves the predecessor hash and its consensus VDF
+			// output from the FSM index, so above genesis the prior block must
+			// already be indexed.
 			if !test.isGenesis {
 				require.NoError(t, sm.store.(lib.StoreI).IndexBlock(&lib.BlockResult{
 					BlockHeader: &lib.BlockHeader{

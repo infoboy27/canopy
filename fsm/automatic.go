@@ -17,25 +17,36 @@ func (s *StateMachine) BeginBlock(lastBlockHash []byte) (lib.Events, lib.ErrorI)
 		s.Metrics.RestrictedTxCount.Set(0)
 	}
 	s.events.Refer(lib.EventStageBeginBlock)
-	// Proposal simulation starts from a skeletal header; unlike validation and
-	// commit, it does not yet carry LastBlockHash. Resolve that one empty case
-	// from the FSM's indexed predecessor so the plugin still receives only
-	// consensus-authenticated entropy. A non-empty malformed header is preserved
-	// and rejected by the plugin rather than silently replaced.
-	if s.height > 1 && len(lastBlockHash) == 0 {
+	// Both entropy inputs the plugin folds -- the predecessor hash and the
+	// predecessor's consensus VDF output -- are resolved from the FSM's own
+	// committed index. That makes them identical for the proposer's block
+	// simulation (which runs against a skeletal header carrying neither) and
+	// for every validator applying the finished block, so folding them into
+	// plugin state stays deterministic.
+	//
+	// The VDF is deliberately taken from block height-1's header (its own VDF,
+	// computed over the block before it), never from the applying header: the
+	// applying header's VDF is over lastBlockHash and is not yet known when the
+	// proposer computes the state root. The predecessor hash still prefers a
+	// non-empty applying-header value so a malformed one is rejected by the
+	// plugin rather than silently replaced.
+	var vdfOutput []byte
+	if s.height > 1 {
 		lastBlock, err := s.LoadBlock(s.height - 1)
 		if err != nil {
 			return nil, err
 		}
-		lastBlockHash = lastBlock.BlockHeader.Hash
+		if len(lastBlockHash) == 0 {
+			lastBlockHash = lastBlock.BlockHeader.Hash
+		}
+		vdfOutput = lastBlock.BlockHeader.GetVdf().GetOutput()
 	}
 	// execute plugin begin block if enabled
 	if s.Plugin != nil {
 		resp, err := s.Plugin.BeginBlock(s, &lib.PluginBeginRequest{
 			Height:        s.height,
 			LastBlockHash: lastBlockHash,
-			// vdf_output is reserved for real-money hardening; the FSM does not
-			// populate it yet (see audit/specs/fair-randomness-v2.md A.2).
+			VdfOutput:     vdfOutput,
 		})
 		if err != nil {
 			return nil, err
