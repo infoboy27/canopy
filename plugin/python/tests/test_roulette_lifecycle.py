@@ -115,6 +115,9 @@ def open_roulette(contract, round_id=b"round001", rake_bps=1000, height=1000,
 
 
 def place_bet(contract, state, player, round_id, amount, bet_type, bet_number=0):
+    reserve = groulette.liability_reserve(bet_type, amount)
+    if player != TREASURY_ADDRESS and state.balance(TREASURY_ADDRESS) < reserve:
+        state.set_balance(TREASURY_ADDRESS, reserve)
     state.set_balance(player, amount)
     msg = MessageRouletteBet(player_address=player, round_id=round_id, bet_type=bet_type,
                               bet_number=bet_number, amount=amount)
@@ -161,15 +164,16 @@ class TestSettleRouletteHappyPath:
         # 10000 - 3500 + 380 = 6880
         assert state.balance(TREASURY_ADDRESS) == 6880
 
-    def test_settle_fails_safely_when_treasury_cannot_cover_shortfall(self, contract, state):
-        # Treasury starts empty -- a big win the round's own pot can't cover
-        # must fail the settle rather than pay out from nothing.
+    def test_bet_fails_before_acceptance_when_liability_cannot_be_reserved(self, contract, state):
+        # Treasury starts empty. The bet itself must fail atomically instead of
+        # creating a round that can only discover insolvency at settlement.
         rid = open_roulette(contract, rake_bps=1000, commitment=seed_commitment(SEED_FOR_1))
-        place_bet(contract, state, PLAYER_A, rid, 100, "straight", 1)  # wins 3600, pot only has 100
-
-        with pytest.raises(PluginError, match="treasury underfunded"):
-            run(contract._deliver_message_settle_roulette(
-                MessageSettleRoulette(operator_address=ADMIN, round_id=rid, seed=SEED_FOR_1)))
+        state.set_balance(PLAYER_A, 100)
+        before = dict(state.kv)
+        with pytest.raises(PluginError, match="insufficient funds"):
+            run(contract._deliver_message_roulette_bet(MessageRouletteBet(
+                player_address=PLAYER_A, round_id=rid, bet_type="straight", bet_number=1, amount=100)))
+        assert state.kv == before
 
     def test_realistic_pot_house_take_goes_to_treasury(self, contract, state):
         rid = open_roulette(contract, rake_bps=1000, commitment=seed_commitment(SEED_FOR_1))
@@ -188,7 +192,7 @@ class TestSettleRouletteHappyPath:
         # escrow fully drained; treasury gets rake (20) + house_take
         # (pot 300 - gross_to_winners 200 = 100) = 120
         assert state.balance(roulette_escrow_address(rid)) == 0
-        assert state.balance(TREASURY_ADDRESS) == 120
+        assert state.balance(TREASURY_ADDRESS) == 420  # initial 300 reserve + 120 house result
 
     def test_zero_loses_every_outside_bet(self, contract, state):
         rid = open_roulette(contract, rake_bps=0, commitment=seed_commitment(SEED_FOR_0))
@@ -203,7 +207,7 @@ class TestSettleRouletteHappyPath:
         assert state.balance(PLAYER_A) == 0
         assert state.balance(PLAYER_B) == 0
         assert state.balance(PLAYER_C) == 0
-        assert state.balance(TREASURY_ADDRESS) == 300  # entire pot -> house
+        assert state.balance(TREASURY_ADDRESS) == 600  # initial 300 reserve + entire 300 pot
 
     def test_wrong_seed_rejected(self, contract, state):
         rid = open_roulette(contract, commitment=seed_commitment(SEED_FOR_1))
@@ -248,7 +252,7 @@ class TestExpireRoulette:
         place_bet(contract, state, PLAYER_A, rid, 100, "red")
         place_bet(contract, state, PLAYER_B, rid, 150, "straight", 1)
 
-        assert state.balance(roulette_escrow_address(rid)) == 250
+        assert state.balance(roulette_escrow_address(rid)) == 5600  # stakes + worst-case reserves
         assert state.balance(PLAYER_A) == 0
         assert state.balance(PLAYER_B) == 0
 
@@ -262,6 +266,7 @@ class TestExpireRoulette:
         assert state.balance(PLAYER_A) == 100
         assert state.balance(PLAYER_B) == 150
         assert state.balance(roulette_escrow_address(rid)) == 0
+        assert state.balance(TREASURY_ADDRESS) == 5350
 
     def test_cannot_expire_twice(self, contract, state):
         rid = open_roulette(contract, height=1000)

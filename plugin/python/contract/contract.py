@@ -1275,16 +1275,18 @@ class Contract:
         bet_key = key_for_roulette_bet(msg.round_id, msg.player_address)
         player_key = key_for_account(msg.player_address)
         escrow_key = key_for_account(roulette_escrow_address(msg.round_id))
-        qr, qb, qpl, qe = (random.randint(0, 2**53) for _ in range(4))
+        treasury_key = key_for_account(TREASURY_ADDRESS)
+        qr, qb, qpl, qe, qt = (random.randint(0, 2**53) for _ in range(5))
         resp = await self.plugin.state_read(self, PluginStateReadRequest(keys=[
             PluginKeyRead(query_id=qr, key=round_key),
             PluginKeyRead(query_id=qb, key=bet_key),
             PluginKeyRead(query_id=qpl, key=player_key),
             PluginKeyRead(query_id=qe, key=escrow_key),
+            PluginKeyRead(query_id=qt, key=treasury_key),
         ]))
         if resp.HasField("error"):
             out = PluginDeliverResponse(); out.error.CopyFrom(resp.error); return out
-        rb = bb = plb = eb = None
+        rb = bb = plb = eb = tb = None
         for r in resp.results:
             if r.query_id == qr:
                 rb = r.entries[0].value if r.entries else None
@@ -1294,6 +1296,8 @@ class Contract:
                 plb = r.entries[0].value if r.entries else None
             elif r.query_id == qe:
                 eb = r.entries[0].value if r.entries else None
+            elif r.query_id == qt:
+                tb = r.entries[0].value if r.entries else None
         rr = unmarshal(RouletteRound, rb) if rb else None
         if rr is None:
             raise PluginError(1, "plugin", "round not found")
@@ -1301,12 +1305,24 @@ class Contract:
             raise PluginError(1, "plugin", "round not open")
         if bb:
             raise PluginError(1, "plugin", "address already has a bet in this round")
-        player = unmarshal(Account, plb) if plb else Account()
+        treasury = unmarshal(Account, tb) if tb else Account()
+        player_is_treasury = player_key == treasury_key
+        player = treasury if player_is_treasury else (unmarshal(Account, plb) if plb else Account())
         escrow = unmarshal(Account, eb) if eb else Account()
-        if player.amount < msg.amount:
+        reserve = groulette.liability_reserve(msg.bet_type, msg.amount)
+        if reserve > UINT64_MAX or msg.amount > UINT64_MAX - reserve:
+            raise err_invalid_amount()
+        required_from_treasury = reserve + (msg.amount if player_is_treasury else 0)
+        if player.amount < msg.amount or treasury.amount < required_from_treasury:
             raise err_insufficient_funds()
-        player.amount -= msg.amount
-        escrow.amount += msg.amount
+        if escrow.amount > UINT64_MAX - msg.amount - reserve or rr.pot_total > UINT64_MAX - msg.amount:
+            raise err_invalid_amount()
+        if player_is_treasury:
+            treasury.amount -= msg.amount + reserve
+        else:
+            player.amount -= msg.amount
+            treasury.amount -= reserve
+        escrow.amount += msg.amount + reserve
         rr.pot_total += msg.amount
         rr.bettor_addresses.append(msg.player_address)
         bet = RouletteBetRecord()
@@ -1315,12 +1331,14 @@ class Contract:
         bet.bet_type = msg.bet_type
         bet.bet_number = msg.bet_number
         bet.amount = msg.amount
-        w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=[
-            PluginSetOp(key=player_key, value=marshal(player)),
+        sets = [] if player_is_treasury else [PluginSetOp(key=player_key, value=marshal(player))]
+        sets.extend([
+            PluginSetOp(key=treasury_key, value=marshal(treasury)),
             PluginSetOp(key=escrow_key, value=marshal(escrow)),
             PluginSetOp(key=round_key, value=marshal(rr)),
             PluginSetOp(key=bet_key, value=marshal(bet)),
-        ]))
+        ])
+        w = await self.plugin.state_write(self, PluginStateWriteRequest(sets=sets))
         out = PluginDeliverResponse()
         if w.HasField("error"):
             out.error.CopyFrom(w.error)
@@ -1457,8 +1475,11 @@ class Contract:
 
         bettors = [bytes(a) for a in rr.bettor_addresses]
         escrow_key = key_for_account(roulette_escrow_address(msg.round_id))
+        treasury_key = key_for_account(TREASURY_ADDRESS)
         qe = random.randint(0, 2**53)
-        keys = [PluginKeyRead(query_id=qe, key=escrow_key)]
+        qt = random.randint(0, 2**53)
+        keys = [PluginKeyRead(query_id=qe, key=escrow_key),
+                PluginKeyRead(query_id=qt, key=treasury_key)]
         bet_qids, acct_qids = [], {}
         for addr in bettors:
             bq = random.randint(0, 2**53)
@@ -1474,6 +1495,7 @@ class Contract:
         for r in resp.results:
             by_qid[r.query_id] = r.entries[0].value if r.entries else None
         escrow = unmarshal(Account, by_qid.get(qe)) if by_qid.get(qe) else Account()
+        treasury = unmarshal(Account, by_qid.get(qt)) if by_qid.get(qt) else Account()
 
         sets = []
         total_refunded = 0
@@ -1484,7 +1506,8 @@ class Contract:
             if amount <= 0:
                 continue
             acct_bytes = by_qid.get(acct_qids[addr])
-            acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
+            acct = treasury if addr == TREASURY_ADDRESS else (
+                unmarshal(Account, acct_bytes) if acct_bytes else Account())
             if acct.amount > UINT64_MAX - amount:
                 raise err_invalid_amount()
             acct.amount += amount
@@ -1493,8 +1516,13 @@ class Contract:
 
         if escrow.amount < total_refunded:
             raise PluginError(1, "plugin", "escrow underfunded")
-        escrow.amount -= total_refunded
+        reserve_release = escrow.amount - total_refunded
+        if treasury.amount > UINT64_MAX - reserve_release:
+            raise err_invalid_amount()
+        treasury.amount += reserve_release
+        escrow.amount = 0
         sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
+        sets.append(PluginSetOp(key=treasury_key, value=marshal(treasury)))
         rr.status = 2  # expired/refunded
         sets.append(PluginSetOp(key=round_key, value=marshal(rr)))
 
