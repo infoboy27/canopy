@@ -93,7 +93,7 @@ def contract(state):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def open_poker(contract, round_id=b"round001", small_blind=SMALL_BLIND, big_blind=BIG_BLIND,

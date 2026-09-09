@@ -620,6 +620,7 @@ class Contract:
 
     async def _deliver_message_send(self, msg: MessageSend, fee: int, memo: str) -> PluginDeliverResponse:
         """DeliverMessageSend handles a 'send' message."""
+        self._check_message_send(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
 
@@ -759,6 +760,7 @@ class Contract:
 
     async def _deliver_message_faucet(self, msg: MessageFaucet) -> PluginDeliverResponse:
         """Mint tokens to recipient (no balance check, no fee) and track a Faucet record."""
+        self._check_message_faucet(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         acct_qid = random.randint(0, 2**53)
@@ -804,6 +806,7 @@ class Contract:
 
     async def _deliver_message_reward(self, msg: MessageReward, fee: int) -> PluginDeliverResponse:
         """Admin pays the fee; mint tokens to recipient and track a Reward record."""
+        self._check_message_reward(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         admin_qid = random.randint(0, 2**53)
@@ -871,6 +874,8 @@ class Contract:
     def _check_message_open_room(self, msg) -> PluginCheckResponse:
         if len(msg.operator_address) != 20:
             raise err_invalid_address()
+        if msg.operator_address not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
         if not msg.round_id:
             raise PluginError(1, "plugin", "empty round_id")
         if len(msg.commitment) != 32:
@@ -881,6 +886,8 @@ class Contract:
             raise PluginError(1, "plugin", "rake_bps must be <= 10000")
         if len(msg.payout_weights_bps) > 0 and sum(msg.payout_weights_bps) != 10000:
             raise PluginError(1, "plugin", "payout_weights_bps must sum to 10000")
+        if any(w == 0 for w in msg.payout_weights_bps):
+            raise PluginError(1, "plugin", "payout weights must be positive")
         r = PluginCheckResponse()
         r.authorized_signers.append(msg.operator_address)
         return r
@@ -905,6 +912,10 @@ class Contract:
             raise PluginError(1, "plugin", "empty round_id")
         if not msg.seed:
             raise PluginError(1, "plugin", "empty seed")
+        # The current round schema does not commit a pattern at open. Allowing
+        # an operator to choose it after seeing the deal changes the winner.
+        if msg.pattern not in ("", "line"):
+            raise PluginError(1, "plugin", "round pattern is fixed to line")
         r = PluginCheckResponse()
         r.authorized_signers.append(msg.operator_address)
         return r
@@ -922,6 +933,7 @@ class Contract:
         return r
 
     async def _deliver_message_open_room(self, msg, height: int = 0) -> PluginDeliverResponse:
+        self._check_message_open_room(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_round(msg.round_id)
@@ -953,6 +965,7 @@ class Contract:
         within ROOM_EXPIRY_BLOCKS. Each participant gets back exactly what
         their own RoomParticipant record says they put in -- not a recomputed
         guess -- so this can't over- or under-pay regardless of who calls it."""
+        self._check_message_expire_room(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_round(msg.round_id)
@@ -997,6 +1010,8 @@ class Contract:
                 continue
             acct_bytes = by_qid.get(acct_qids[addr])
             acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
+            if acct.amount > UINT64_MAX - amount:
+                raise err_invalid_amount()
             acct.amount += amount
             total_refunded += amount
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
@@ -1015,6 +1030,7 @@ class Contract:
         return out
 
     async def _deliver_message_join_room(self, msg) -> PluginDeliverResponse:
+        self._check_message_join_room(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_round(msg.round_id)
@@ -1047,8 +1063,13 @@ class Contract:
             raise PluginError(1, "plugin", "round not open")
         if pb:
             raise PluginError(1, "plugin", "player already joined")
+        expected = rr.entry_fee * gecon.CARD_COST_MULTIPLIER_BPS[msg.num_cards] // 10000
+        if msg.amount != expected:
+            raise PluginError(1, "plugin", "amount must equal the round's card entry cost")
         player = unmarshal(Account, plb) if plb else Account()
         escrow = unmarshal(Account, eb) if eb else Account()
+        if escrow.amount > UINT64_MAX - msg.amount or rr.escrow_total > UINT64_MAX - msg.amount:
+            raise err_invalid_amount()
         if player.amount < msg.amount:
             raise err_insufficient_funds()
         player.amount -= msg.amount
@@ -1077,6 +1098,7 @@ class Contract:
         """Trustless settle: operator only reveals the seed. The plugin recomputes
         every participant's cards from the seed, ranks the winners by who completes
         the pattern first, and pays the top ranks by the round's payout weights."""
+        self._check_message_settle_room(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_round(msg.round_id)
@@ -1144,11 +1166,16 @@ class Contract:
         if escrow.amount < total:
             raise PluginError(1, "plugin", "escrow underfunded")
         escrow.amount -= total
+        if treasury.amount > UINT64_MAX - rake:
+            raise err_invalid_amount()
         treasury.amount += rake
         sets = [PluginSetOp(key=escrow_key, value=marshal(escrow)),
                 PluginSetOp(key=treasury_key, value=marshal(treasury))]
         for i, (q, addr) in enumerate(winner_qids):
-            acct = unmarshal(Account, by_qid.get(q)) if by_qid.get(q) else Account()
+            acct = treasury if addr == TREASURY_ADDRESS else (
+                unmarshal(Account, by_qid.get(q)) if by_qid.get(q) else Account())
+            if acct.amount > UINT64_MAX - payouts[i]:
+                raise err_invalid_amount()
             acct.amount += payouts[i]
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
         rr.status = 1
@@ -1216,6 +1243,7 @@ class Contract:
         return r
 
     async def _deliver_message_open_roulette(self, msg, height: int = 0) -> PluginDeliverResponse:
+        self._check_message_open_roulette(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_roulette_round(msg.round_id)
@@ -1240,6 +1268,7 @@ class Contract:
         return out
 
     async def _deliver_message_roulette_bet(self, msg) -> PluginDeliverResponse:
+        self._check_message_roulette_bet(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_roulette_round(msg.round_id)
@@ -1306,6 +1335,7 @@ class Contract:
         their own bet's odds; whatever the escrow doesn't pay out (losing
         stakes) plus the rake skimmed off winning payouts both go to the
         treasury, so escrow always ends a settle at exactly zero."""
+        self._check_message_settle_roulette(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_roulette_round(msg.round_id)
@@ -1363,7 +1393,10 @@ class Contract:
             rake = gross * rr.rake_bps // 10000
             net = gross - rake
             acct_bytes = by_qid.get(acct_qids[addr])
-            acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
+            acct = treasury if addr == TREASURY_ADDRESS else (
+                unmarshal(Account, acct_bytes) if acct_bytes else Account())
+            if acct.amount > UINT64_MAX - net:
+                raise err_invalid_amount()
             acct.amount += net
             total_gross_to_winners += gross
             total_rake += rake
@@ -1378,11 +1411,15 @@ class Contract:
         # rather than paying out from nothing.
         if escrow.amount >= total_gross_to_winners:
             house_take = escrow.amount - total_gross_to_winners  # losing stakes -> pure house profit
+            if treasury.amount > UINT64_MAX - total_rake - house_take:
+                raise err_invalid_amount()
             treasury.amount += total_rake + house_take
         else:
             shortfall = total_gross_to_winners - escrow.amount
-            if treasury.amount < shortfall:
+            if treasury.amount + total_rake < shortfall:
                 raise PluginError(1, "plugin", "treasury underfunded to cover payout")
+            if treasury.amount + total_rake - shortfall > UINT64_MAX:
+                raise err_invalid_amount()
             treasury.amount += total_rake - shortfall
         escrow.amount = 0
         sets.append(PluginSetOp(key=escrow_key, value=marshal(escrow)))
@@ -1403,6 +1440,7 @@ class Contract:
         """Refund every escrowed bet for a round the operator never settled
         within ROOM_EXPIRY_BLOCKS. Each bettor gets back exactly what their own
         RouletteBetRecord says they staked -- not a recomputed guess."""
+        self._check_message_expire_roulette(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_roulette_round(msg.round_id)
@@ -1447,6 +1485,8 @@ class Contract:
                 continue
             acct_bytes = by_qid.get(acct_qids[addr])
             acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
+            if acct.amount > UINT64_MAX - amount:
+                raise err_invalid_amount()
             acct.amount += amount
             total_refunded += amount
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
@@ -1520,6 +1560,7 @@ class Contract:
         return r
 
     async def _deliver_message_open_domino(self, msg, height: int = 0) -> PluginDeliverResponse:
+        self._check_message_open_domino(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_domino_round(msg.round_id)
@@ -1545,6 +1586,7 @@ class Contract:
         return out
 
     async def _deliver_message_join_domino(self, msg) -> PluginDeliverResponse:
+        self._check_message_join_domino(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_domino_round(msg.round_id)
@@ -1603,6 +1645,7 @@ class Contract:
         here to also validate the moves since domino's outcome depends on
         player choices, not just the seed. An illegal move anywhere in the
         claimed log rejects the whole settle -- there is no partial credit."""
+        self._check_message_settle_domino(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_domino_round(msg.round_id)
@@ -1664,11 +1707,16 @@ class Contract:
         if escrow.amount < total:
             raise PluginError(1, "plugin", "escrow underfunded")
         escrow.amount -= total
+        if treasury.amount > UINT64_MAX - rake:
+            raise err_invalid_amount()
         treasury.amount += rake
         sets = [PluginSetOp(key=escrow_key, value=marshal(escrow)),
                 PluginSetOp(key=treasury_key, value=marshal(treasury))]
         for i, (q, addr) in enumerate(winner_qids):
-            acct = unmarshal(Account, by_qid.get(q)) if by_qid.get(q) else Account()
+            acct = treasury if addr == TREASURY_ADDRESS else (
+                unmarshal(Account, by_qid.get(q)) if by_qid.get(q) else Account())
+            if acct.amount > UINT64_MAX - payouts[i]:
+                raise err_invalid_amount()
             acct.amount += payouts[i]
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
 
@@ -1688,6 +1736,7 @@ class Contract:
         """Refund every escrowed entry fee for a round the operator never
         settled within ROOM_EXPIRY_BLOCKS -- including a round that only ever
         got one participant (that one address is simply refunded alone)."""
+        self._check_message_expire_domino(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_domino_round(msg.round_id)
@@ -1724,6 +1773,8 @@ class Contract:
         for addr in participants:
             acct_bytes = by_qid.get(acct_qids[addr])
             acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
+            if acct.amount > UINT64_MAX - rr.entry_fee:
+                raise err_invalid_amount()
             acct.amount += rr.entry_fee
             total_refunded += rr.entry_fee
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
@@ -1799,6 +1850,7 @@ class Contract:
         return r
 
     async def _deliver_message_open_poker(self, msg, height: int = 0) -> PluginDeliverResponse:
+        self._check_message_open_poker(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_poker_round(msg.round_id)
@@ -1826,6 +1878,7 @@ class Contract:
         return out
 
     async def _deliver_message_join_poker(self, msg) -> PluginDeliverResponse:
+        self._check_message_join_poker(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_poker_round(msg.round_id)
@@ -1885,6 +1938,7 @@ class Contract:
         Domino's even pari-mutuel split, poker's payout must account for
         chips a participant never put in (stacks_remaining, always returned
         untaxed) alongside a rake taken only from the actually-contested pot."""
+        self._check_message_settle_poker(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_poker_round(msg.round_id)
@@ -1946,11 +2000,16 @@ class Contract:
         if escrow.amount < rr.escrow_total:
             raise PluginError(1, "plugin", "escrow underfunded")
         escrow.amount -= rr.escrow_total
+        if treasury.amount > UINT64_MAX - rake:
+            raise err_invalid_amount()
         treasury.amount += rake
         sets = [PluginSetOp(key=escrow_key, value=marshal(escrow)),
                 PluginSetOp(key=treasury_key, value=marshal(treasury))]
         for q, addr in participant_qids:
-            acct = unmarshal(Account, by_qid.get(q)) if by_qid.get(q) else Account()
+            acct = treasury if addr == TREASURY_ADDRESS else (
+                unmarshal(Account, by_qid.get(q)) if by_qid.get(q) else Account())
+            if acct.amount > UINT64_MAX - final_payouts[addr]:
+                raise err_invalid_amount()
             acct.amount += final_payouts[addr]
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
 
@@ -1971,6 +2030,7 @@ class Contract:
         settled within ROOM_EXPIRY_BLOCKS -- including a round that only
         ever got one participant (that one address is simply refunded
         alone)."""
+        self._check_message_expire_poker(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         round_key = key_for_poker_round(msg.round_id)
@@ -2007,6 +2067,8 @@ class Contract:
         for addr in participants:
             acct_bytes = by_qid.get(acct_qids[addr])
             acct = unmarshal(Account, acct_bytes) if acct_bytes else Account()
+            if acct.amount > UINT64_MAX - rr.buy_in:
+                raise err_invalid_amount()
             acct.amount += rr.buy_in
             total_refunded += rr.buy_in
             sets.append(PluginSetOp(key=key_for_account(addr), value=marshal(acct)))
@@ -2063,6 +2125,7 @@ class Contract:
         return val, None
 
     async def _deliver_buy_coins(self, msg):
+        self._check_mint_like(msg.admin_address, msg.recipient_address, msg.amount)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         key = key_for_account(msg.recipient_address)
@@ -2081,6 +2144,7 @@ class Contract:
         return out
 
     async def _deliver_buy_gems(self, msg):
+        self._check_mint_like(msg.admin_address, msg.recipient_address, msg.amount)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         key = key_for_gems(msg.recipient_address)
@@ -2100,6 +2164,7 @@ class Contract:
         return out
 
     async def _deliver_transfer_gems(self, msg):
+        self._check_transfer_gems(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         from_key = key_for_gems(msg.from_address)
@@ -2147,6 +2212,8 @@ class Contract:
             raise PluginError(1, "plugin", "empty token_id")
         if not msg.kind:
             raise PluginError(1, "plugin", "empty kind")
+        if msg.operator_address not in ADMIN_ADDRESSES:
+            raise err_unauthorized_signer()
         r = PluginCheckResponse()
         r.recipient = msg.owner_address
         r.authorized_signers.append(msg.operator_address)
@@ -2174,6 +2241,7 @@ class Contract:
         return r
 
     async def _deliver_mint_cosmetic(self, msg):
+        self._check_mint_cosmetic(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         key = key_for_cosmetic(msg.token_id)
@@ -2194,6 +2262,7 @@ class Contract:
         return out
 
     async def _deliver_buy_cosmetic(self, msg):
+        self._check_buy_cosmetic(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         # price comes from the SHARED economy catalog (must be a gem-priced item)
@@ -2240,6 +2309,7 @@ class Contract:
         return out
 
     async def _deliver_transfer_cosmetic(self, msg):
+        self._check_transfer_cosmetic(msg)
         if not self.plugin or not self.config:
             raise PluginError(1, "plugin", "plugin or config not initialized")
         key = key_for_cosmetic(msg.token_id)

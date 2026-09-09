@@ -102,7 +102,7 @@ def contract(state):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def open_roulette(contract, round_id=b"round001", rake_bps=1000, height=1000,

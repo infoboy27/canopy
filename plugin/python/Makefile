@@ -31,21 +31,21 @@ test-unit: dev
 	$(VENV_DIR)/bin/pytest
 
 test-cov: dev
-	$(VENV_DIR)/bin/pytest --cov=plugin --cov-report=html --cov-report=term
+	$(VENV_DIR)/bin/pytest --cov=contract --cov-report=html --cov-report=term
 
 test-verbose: dev
 	$(VENV_DIR)/bin/pytest -v
 
 # Code quality
 lint: venv
-	$(VENV_DIR)/bin/flake8 plugin/ tests/
+	$(VENV_DIR)/bin/flake8 contract/ tests/
 
 format: venv
-	$(VENV_DIR)/bin/black plugin/ tests/
-	$(VENV_DIR)/bin/isort plugin/ tests/
+	$(VENV_DIR)/bin/black contract/ tests/
+	$(VENV_DIR)/bin/isort contract/ tests/
 
 type-check: venv
-	$(VENV_DIR)/bin/mypy plugin/
+	$(VENV_DIR)/bin/mypy contract/
 
 # Protobuf generation
 proto: venv

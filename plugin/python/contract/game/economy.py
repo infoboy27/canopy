@@ -40,14 +40,24 @@ COIN_DECIMALS = 6
 GEM_DECIMALS = 0
 
 
+def _nonnegative_integer(value: int, name: str) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+
+
 def to_base_units(amount: int, currency: Currency) -> int:
     """Display units -> on-chain uint64 base units."""
+    _nonnegative_integer(amount, "amount")
     decimals = COIN_DECIMALS if currency == Currency.COINS else GEM_DECIMALS
-    return int(amount) * (10 ** decimals)
+    result = amount * (10 ** decimals)
+    if result > (1 << 64) - 1:
+        raise ValueError("amount exceeds uint64 base units")
+    return result
 
 
 def from_base_units(base: int, currency: Currency) -> int:
     """On-chain base units -> whole display units (floor)."""
+    _nonnegative_integer(base, "base")
     decimals = COIN_DECIMALS if currency == Currency.COINS else GEM_DECIMALS
     return int(base) // (10 ** decimals)
 
@@ -149,7 +159,7 @@ def card_selection(room_id: str) -> list[dict]:
 
 
 def _validate_card_count(num_cards: int) -> None:
-    if num_cards not in CARD_COST_MULTIPLIER_BPS:
+    if type(num_cards) is not int or num_cards not in CARD_COST_MULTIPLIER_BPS:
         raise ValueError(f"num_cards must be {MIN_CARDS}..{MAX_CARDS}, got {num_cards}")
 
 
@@ -160,13 +170,15 @@ def _validate_card_count(num_cards: int) -> None:
 
 def prize_pool(entries: Sequence[int]) -> int:
     """Gross pool = every entry fee collected for the room."""
-    if any(e < 0 for e in entries):
-        raise ValueError("entry amounts must be non-negative")
+    for entry in entries:
+        _nonnegative_integer(entry, "entry amount")
     return sum(entries)
 
 
 def apply_rake(gross_pool: int, rake_bps: int) -> tuple[int, int]:
     """Split a gross pool into (net_to_players, house_take)."""
+    _nonnegative_integer(gross_pool, "gross_pool")
+    _nonnegative_integer(rake_bps, "rake_bps")
     if not 0 <= rake_bps <= 10_000:
         raise ValueError("rake_bps must be 0..10000")
     house = gross_pool * rake_bps // 10_000
@@ -179,6 +191,9 @@ def distribute(net_pool: int, weights_bps: Sequence[int]) -> list[int]:
     Integer division; any rounding remainder goes to the top rank so the sum of
     payouts always equals ``net_pool`` exactly (no coins created or lost).
     """
+    _nonnegative_integer(net_pool, "net_pool")
+    if not weights_bps or any(type(w) is not int or w <= 0 for w in weights_bps):
+        raise ValueError("payout weights must be positive integers")
     if sum(weights_bps) != 10_000:
         raise ValueError("payout weights must sum to 10000 bps")
     payouts = [net_pool * w // 10_000 for w in weights_bps]
@@ -371,15 +386,19 @@ class Balance:
     xp: int = 0
 
     def can_afford(self, currency: Currency, amount: int) -> bool:
+        _nonnegative_integer(amount, "amount")
         return getattr(self, currency.value) >= amount
 
     def credit(self, reward: Reward) -> "Balance":
+        for amount in (reward.coins, reward.gems, reward.xp):
+            _nonnegative_integer(amount, "reward amount")
         self.coins += reward.coins
         self.gems += reward.gems
         self.xp += reward.xp
         return self
 
     def debit(self, currency: Currency, amount: int) -> "Balance":
+        _nonnegative_integer(amount, "amount")
         if amount < 0:
             raise ValueError("cannot debit a negative amount")
         if not self.can_afford(currency, amount):

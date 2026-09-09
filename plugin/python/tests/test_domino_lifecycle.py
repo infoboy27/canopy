@@ -87,7 +87,7 @@ def contract(state):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def open_domino(contract, round_id=b"round001", entry_fee=100, rake_bps=1000, height=1000,

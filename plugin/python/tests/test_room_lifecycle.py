@@ -94,7 +94,7 @@ def contract(state):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def open_room(contract, round_id=b"round001", entry_fee=100, rake_bps=1000, height=1000,
@@ -161,9 +161,9 @@ class TestExpireRoom:
     def test_refunds_every_participant_after_deadline(self, contract, state):
         rid = open_room(contract, entry_fee=100, height=1000)
         join_room(contract, state, PLAYER_A, rid, 100)
-        join_room(contract, state, PLAYER_B, rid, 100, num_cards=2)
+        join_room(contract, state, PLAYER_B, rid, 180, num_cards=2)
 
-        assert state.balance(escrow_address(rid)) == 200
+        assert state.balance(escrow_address(rid)) == 280
         assert state.balance(PLAYER_A) == 0  # spent joining
         assert state.balance(PLAYER_B) == 0
 
@@ -176,7 +176,7 @@ class TestExpireRoom:
         assert not resp.HasField("error"), resp.error.msg
 
         assert state.balance(PLAYER_A) == 100
-        assert state.balance(PLAYER_B) == 100
+        assert state.balance(PLAYER_B) == 180
         assert state.balance(escrow_address(rid)) == 0
 
     def test_cannot_expire_twice(self, contract, state):
