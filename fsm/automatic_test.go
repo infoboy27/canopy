@@ -125,7 +125,7 @@ func TestBeginBlock(t *testing.T) {
 			}
 			// get last validator set for begin block
 			// ensure expected error on function call
-			_, err = sm.BeginBlock()
+			_, err = sm.BeginBlock(nil)
 			if test.error != nil {
 				return
 			}

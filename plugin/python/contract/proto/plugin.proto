@@ -93,8 +93,16 @@ message PluginGenesisRequest {bytes genesis_json = 1;}
 // PluginGenesisResponse acknowledges genesis execution completion
 message PluginGenesisResponse {PluginError error = 99;}
 
-// PluginBeginRequest signals start of a new block
-message PluginBeginRequest {uint64 height = 1; }
+// PluginBeginRequest signals start of a new block. last_block_hash and
+// vdf_output are supplied by the FSM from the already committed predecessor
+// block header; plugins must never accept an operator- or RPC-supplied
+// substitute for consensus entropy. vdf_output is reserved for real-money
+// hardening and is empty until the FSM is wired to populate it.
+message PluginBeginRequest {
+  uint64 height = 1;
+  bytes last_block_hash = 2; // @gotags: json:"lastBlockHash"
+  bytes vdf_output = 3;      // @gotags: json:"vdfOutput"
+}
 
 // PluginBeginResponse acknowledges begin block execution
 message PluginBeginResponse {

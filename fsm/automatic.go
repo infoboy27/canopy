@@ -7,15 +7,24 @@ import (
 
 /* This file handles 'automatic' (non-transaction-induced) state changes that occur at the beginning and ending of a block */
 
-// BeginBlock() is code that is executed at the start of `applying` the block
-func (s *StateMachine) BeginBlock() (lib.Events, lib.ErrorI) {
+// BeginBlock() is code that is executed at the start of `applying` the block.
+// lastBlockHash is the consensus-verified hash of the predecessor block, taken
+// from the applying block's header (empty only at height 1). It is forwarded to
+// the plugin verbatim as unpredictable, consensus-authenticated entropy: the
+// plugin must never accept an operator- or RPC-supplied substitute.
+func (s *StateMachine) BeginBlock(lastBlockHash []byte) (lib.Events, lib.ErrorI) {
 	if s.Metrics != nil {
 		s.Metrics.RestrictedTxCount.Set(0)
 	}
 	s.events.Refer(lib.EventStageBeginBlock)
 	// execute plugin begin block if enabled
 	if s.Plugin != nil {
-		resp, err := s.Plugin.BeginBlock(s, &lib.PluginBeginRequest{Height: s.height})
+		resp, err := s.Plugin.BeginBlock(s, &lib.PluginBeginRequest{
+			Height:        s.height,
+			LastBlockHash: lastBlockHash,
+			// vdf_output is reserved for real-money hardening; the FSM does not
+			// populate it yet (see audit/specs/fair-randomness-v2.md A.2).
+		})
 		if err != nil {
 			return nil, err
 		}

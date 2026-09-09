@@ -729,10 +729,16 @@ func (x *PluginGenesisResponse) GetError() *PluginError {
 	return nil
 }
 
-// PluginBeginRequest signals start of a new block
+// PluginBeginRequest signals start of a new block. last_block_hash and
+// vdf_output are supplied by the FSM from the already committed predecessor
+// block header; plugins must never accept an operator- or RPC-supplied
+// substitute for consensus entropy. vdf_output is reserved for real-money
+// hardening and is empty until the FSM is wired to populate it.
 type PluginBeginRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Height        uint64                 `protobuf:"varint,1,opt,name=height,proto3" json:"height,omitempty"`
+	LastBlockHash []byte                 `protobuf:"bytes,2,opt,name=last_block_hash,json=lastBlockHash,proto3" json:"lastBlockHash"` // @gotags: json:"lastBlockHash"
+	VdfOutput     []byte                 `protobuf:"bytes,3,opt,name=vdf_output,json=vdfOutput,proto3" json:"vdfOutput"`               // @gotags: json:"vdfOutput"
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -772,6 +778,20 @@ func (x *PluginBeginRequest) GetHeight() uint64 {
 		return x.Height
 	}
 	return 0
+}
+
+func (x *PluginBeginRequest) GetLastBlockHash() []byte {
+	if x != nil {
+		return x.LastBlockHash
+	}
+	return nil
+}
+
+func (x *PluginBeginRequest) GetVdfOutput() []byte {
+	if x != nil {
+		return x.VdfOutput
+	}
+	return nil
 }
 
 // PluginBeginResponse acknowledges begin block execution
@@ -1926,9 +1946,12 @@ const file_plugin_proto_rawDesc = "" +
 	"\x14PluginGenesisRequest\x12!\n" +
 	"\fgenesis_json\x18\x01 \x01(\fR\vgenesisJson\"A\n" +
 	"\x15PluginGenesisResponse\x12(\n" +
-	"\x05error\x18c \x01(\v2\x12.types.PluginErrorR\x05error\",\n" +
+	"\x05error\x18c \x01(\v2\x12.types.PluginErrorR\x05error\"s\n" +
 	"\x12PluginBeginRequest\x12\x16\n" +
-	"\x06height\x18\x01 \x01(\x04R\x06height\"e\n" +
+	"\x06height\x18\x01 \x01(\x04R\x06height\x12&\n" +
+	"\x0flast_block_hash\x18\x02 \x01(\fR\rlastBlockHash\x12\x1d\n" +
+	"\n" +
+	"vdf_output\x18\x03 \x01(\fR\tvdfOutput\"e\n" +
 	"\x13PluginBeginResponse\x12$\n" +
 	"\x06events\x18\x01 \x03(\v2\f.types.EventR\x06events\x12(\n" +
 	"\x05error\x18c \x01(\v2\x12.types.PluginErrorR\x05error\"P\n" +

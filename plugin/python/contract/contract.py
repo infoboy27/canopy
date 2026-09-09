@@ -100,6 +100,23 @@ from .error import (
 # isn't punished, short enough that abandoned rooms don't lock funds for long.
 ROOM_EXPIRY_BLOCKS = 720
 
+# -- Fair randomness v2: consensus-authenticated close/reveal ----------------
+# See audit/specs/fair-randomness-v2.md. Every money game derives its outcome
+# from SHA256(RNG_V2_SEED_DOMAIN || operator_secret || entropy || round_id)
+# where `entropy` folds a window of finalized block hashes that did not exist
+# when betting closed -- so the operator cannot predict or grind the result.
+RNG_V2_SEED_DOMAIN = b"CANASINO-RNG-V2"
+RNG_V2_ENTROPY_DOMAIN = b"CANASINO-RNG-V2-ENTROPY"
+
+# close_height -> first block whose hash feeds the entropy fold. Must exceed 0
+# so none of the window blocks exist yet when MessageClose* lands.
+ENTROPY_DELAY_BLOCKS = 8
+# number of consecutive finalized block hashes folded into the entropy value.
+# Grinding requires controlling an unbroken run of this many proposers.
+ENTROPY_WINDOW_BLOCKS = 8
+# blocks after entropy_end before MessageExpire* can refund an unsettled round.
+SETTLE_GRACE_BLOCKS = 720
+
 
 # Plugin configuration (matching Go's ContractConfig)
 CONTRACT_CONFIG = {
@@ -135,7 +152,7 @@ CONTRACT_CONFIG = {
         "type.googleapis.com/types.MessageExpirePoker",
     ],
     "event_type_urls": [],
-    "custom_state_prefixes": [b"\x64", b"\x65", b"\x6e", b"\x6f", b"\x70", b"\x71", b"\x72", b"\x73", b"\x74", b"\x75"],  # +112 gems,113 cosmetic,114/115 roulette,116 domino,117 poker
+    "custom_state_prefixes": [b"\x64", b"\x65", b"\x6e", b"\x6f", b"\x70", b"\x71", b"\x72", b"\x73", b"\x74", b"\x75", b"\x76"],  # +112 gems,113 cosmetic,114/115 roulette,116 domino,117 poker,118 consensus entropy
     # Include google/protobuf/any.proto first as it's a dependency of event.proto and tx.proto
     "file_descriptor_protos": [
         any_pb2.DESCRIPTOR.serialized_pb,
@@ -317,6 +334,11 @@ def domino_escrow_address(round_id: bytes) -> bytes:
 
 
 POKER_ROUND_PREFIX = b"\x75"  # 117
+CONSENSUS_ENTROPY_PREFIX = b"\x76"  # 118
+# predecessor hashes retained in the ledger; must exceed the longest possible
+# gap between a round's close and its settle
+# (ENTROPY_DELAY + ENTROPY_WINDOW + SETTLE_GRACE, ~745 blocks by default).
+CONSENSUS_ENTROPY_RETENTION = 4096
 
 
 def key_for_poker_round(round_id: bytes) -> bytes:
@@ -324,6 +346,37 @@ def key_for_poker_round(round_id: bytes) -> bytes:
     (heads-up v1), both addresses live directly on PokerRound.participant_addresses,
     same as DominoRound."""
     return join_len_prefix(POKER_ROUND_PREFIX, round_id)
+
+
+def key_for_consensus_entropy(height: int) -> bytes:
+    """Ledger key for the finalized entropy of block `height`. Big-endian height
+    keeps ledger order == numeric order."""
+    return join_len_prefix(CONSENSUS_ENTROPY_PREFIX, format_uint64(height))
+
+
+def encode_consensus_entropy(last_block_hash: bytes, vdf_output: bytes) -> bytes:
+    """Ledger value: the 32-byte predecessor hash followed by the (currently
+    empty) VDF output. Fixed 32-byte hash prefix means no separator is needed."""
+    return bytes(last_block_hash) + bytes(vdf_output)
+
+
+def rng_v2_seed(operator_secret: bytes, entropy: bytes, round_id: bytes) -> bytes:
+    """The replay seed every money game derives its outcome from. `entropy` is
+    the consensus fold from `fold_consensus_entropy`; `operator_secret` is the
+    value the operator committed to at open and reveals at settle."""
+    return derive_seed(RNG_V2_SEED_DOMAIN, bytes(operator_secret),
+                       bytes(entropy), bytes(round_id))
+
+
+def fold_consensus_entropy(window: "list[bytes]") -> bytes:
+    """Fold an ordered list of ledger values (hash||vdf per block) into one
+    32-byte entropy value. Caller guarantees the window is complete and in
+    ascending height order."""
+    h = hashlib.sha256()
+    h.update(RNG_V2_ENTROPY_DOMAIN)
+    for v in window:
+        h.update(v)
+    return h.digest()
 
 
 def poker_escrow_address(round_id: bytes) -> bytes:
@@ -355,9 +408,83 @@ class Contract:
         """Genesis implements logic to import a json file to create the state at height 0."""
         return PluginGenesisResponse()
 
-    def begin_block(self, request: PluginBeginRequest) -> PluginBeginResponse:
-        """BeginBlock is code that is executed at the start of applying the block."""
-        return PluginBeginResponse()
+    async def begin_block(self, request: PluginBeginRequest) -> PluginBeginResponse:
+        """Persist the FSM-authenticated predecessor block hash as the entropy
+        ledger entry for height-1 (see audit/specs/fair-randomness-v2.md A.3).
+
+        At block H the hash belongs to committed block H-1. Height 0 is a
+        harmless unit-test/default request and height 1 has no predecessor. A
+        post-upgrade FSM that omits or corrupts the hash fails closed so a
+        settle can never consume unauthenticated entropy.
+        """
+        response = PluginBeginResponse()
+        try:
+            if request.height <= 1:
+                return response
+            if len(request.last_block_hash) != 32:
+                raise PluginError(
+                    1, "canasino",
+                    "missing or invalid consensus last block hash",
+                )
+            if not self.plugin:
+                raise PluginError(
+                    1, "canasino",
+                    "plugin not initialized for consensus entropy",
+                )
+            predecessor_height = request.height - 1
+            sets = [PluginSetOp(
+                key=key_for_consensus_entropy(predecessor_height),
+                value=encode_consensus_entropy(
+                    request.last_block_hash, request.vdf_output),
+            )]
+            deletes = []
+            stale_height = predecessor_height - CONSENSUS_ENTROPY_RETENTION
+            if stale_height >= 2:
+                deletes.append(PluginDeleteOp(
+                    key=key_for_consensus_entropy(stale_height)))
+            written = await self.plugin.state_write(
+                self, PluginStateWriteRequest(sets=sets, deletes=deletes))
+            if written.HasField("error"):
+                response.error.CopyFrom(written.error)
+        except PluginError as e:
+            response.error.code = e.code
+            response.error.module = e.module
+            response.error.msg = e.msg
+        return response
+
+    async def _fold_consensus_entropy(self, entropy_start: int, entropy_end: int):
+        """Read heights [entropy_start, entropy_end] from the entropy ledger and
+        fold them into one 32-byte value. Returns (entropy, None) on success or
+        (None, PluginError) if any block in the window is missing -- settle then
+        fails closed rather than guessing.
+
+        The window is small (ENTROPY_WINDOW_BLOCKS), so this is a plain
+        multi-key read; no range scan needed.
+        """
+        qids = {}
+        keys = []
+        for h in range(entropy_start, entropy_end + 1):
+            q = random.randint(0, 2**53)
+            qids[q] = h
+            keys.append(PluginKeyRead(query_id=q, key=key_for_consensus_entropy(h)))
+        resp = await self.plugin.state_read(self, PluginStateReadRequest(keys=keys))
+        if resp.HasField("error"):
+            return None, resp.error
+        by_height = {}
+        for r in resp.results:
+            h = qids.get(r.query_id)
+            if h is not None and r.entries:
+                by_height[h] = bytes(r.entries[0].value)
+        window = []
+        for h in range(entropy_start, entropy_end + 1):
+            v = by_height.get(h)
+            if v is None or len(v) < 32:
+                return None, PluginError(
+                    1, "canasino",
+                    f"consensus entropy for height {h} is not available",
+                )
+            window.append(v)
+        return fold_consensus_entropy(window), None
 
     async def check_tx(self, request: PluginCheckRequest) -> PluginCheckResponse:
         """CheckTx is code that is executed to statelessly validate a transaction."""
