@@ -110,7 +110,13 @@ def run(coro):
 
 def open_poker(contract, round_id=DEFAULT_RID, small_blind=SMALL_BLIND, big_blind=BIG_BLIND,
                buy_in=BUY_IN, rake_bps=RAKE_BPS, height=DEFAULT_OPEN_HEIGHT, commitment=b"c" * 32,
-               operator=ADMIN, operator_bond=OPERATOR_BOND):
+               operator=ADMIN, operator_bond=None):
+    # The bond floor is max(MIN_OPERATOR_BOND_UCNPY, buy_in) -- default to
+    # BUY_IN itself (not the shared OPERATOR_BOND, which is calibrated for
+    # Bingo/Domino's smaller entry_fee) so this helper stays valid regardless
+    # of which buy_in a test passes in.
+    if operator_bond is None:
+        operator_bond = max(OPERATOR_BOND, buy_in)
     if operator == ADMIN:
         fund_operator(contract.plugin, operator_bond)
     msg = MessageOpenPoker(operator_address=operator, round_id=round_id, commitment=commitment,

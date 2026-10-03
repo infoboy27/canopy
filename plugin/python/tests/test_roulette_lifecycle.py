@@ -328,3 +328,49 @@ class TestExpireRoulette:
                 MessageExpireRoulette(caller_address=PLAYER_A, round_id=b"nope"),
                 height=999_999,
             ))
+
+    def test_refund_conserves_funds_when_treasury_is_a_bettor(self, contract, state):
+        # Unlike Bingo/Domino/Poker (which reject the treasury as a
+        # participant outright), the treasury can legitimately place a
+        # roulette bet -- so its account gets written to twice in one
+        # expire: once inside the per-bettor refund loop (the `addr ==
+        # TREASURY_ADDRESS` branch) and again when the released worst-case
+        # reserve and the slashed operator bond land in the same account.
+        # Both ops append to the same `sets` list and the FSM applies them
+        # in list order (last write wins) -- this only stays correct
+        # because both code paths mutate the SAME in-memory `treasury`
+        # object, so the later write already carries the earlier
+        # increment. Pin the exact final balance down so a future refactor
+        # that reads a fresh/stale copy for either write gets caught
+        # immediately instead of silently losing treasury's own stake.
+        state.set_balance(TREASURY_ADDRESS, 10_000)
+        rid = open_roulette(contract, height=1000)
+        place_bet(contract, state, PLAYER_A, rid, 100, "red")
+        # Can't use the place_bet() helper for the treasury's own bet: it
+        # unconditionally overwrites the bettor's balance to exactly the
+        # stake amount, which would wipe out the bankroll treasury also
+        # needs as backstop for this round's liability reserve. Fund it
+        # generously and place the bet directly instead.
+        state.set_balance(TREASURY_ADDRESS, 10_000)
+        resp = run(contract._deliver_message_roulette_bet(MessageRouletteBet(
+            player_address=TREASURY_ADDRESS, round_id=rid, bet_type="black", bet_number=0, amount=50)))
+        assert not resp.HasField("error"), resp.error.msg
+
+        treasury_before = state.balance(TREASURY_ADDRESS)
+        escrow_before = state.balance(roulette_escrow_address(rid))
+
+        resp = run(contract._deliver_message_expire_roulette(
+            MessageExpireRoulette(caller_address=PLAYER_A, round_id=rid),
+            height=1000 + ROOM_EXPIRY_BLOCKS,
+        ))
+        assert not resp.HasField("error"), resp.error.msg
+
+        assert state.balance(PLAYER_A) == 100
+        assert state.balance(roulette_escrow_address(rid)) == 0
+        assert state.balance(roulette_bond_address(rid)) == 0
+        # Treasury recovers its own 50 stake, the entire remaining escrow
+        # (everyone else's worst-case reserve, since only PLAYER_A's 100
+        # stake left to a non-treasury address), and the slashed bond --
+        # nothing lost or double-counted across the two writes.
+        expected = treasury_before + (escrow_before - 100) + OPERATOR_BOND
+        assert state.balance(TREASURY_ADDRESS) == expected

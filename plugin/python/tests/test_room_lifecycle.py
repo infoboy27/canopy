@@ -15,6 +15,7 @@ import asyncio
 
 import pytest
 
+import contract.contract as contract_mod
 from contract.contract import (
     Contract,
     ADMIN_ADDRESSES,
@@ -59,6 +60,14 @@ PLAYER_A = b"p" * 20
 PLAYER_B = b"q" * 20
 SEED = b"s" * 32
 OPERATOR_BOND = 500
+
+# These lifecycle tests use small abstract amounts (entry fees/buy-ins in the
+# low hundreds), not real micro-CNPY scale -- lower the real-world minimum-
+# bond floor (normally 10 CNPY = 10_000_000) to match OPERATOR_BOND above,
+# the same way test_fair_randomness_v2.py overrides REQUIRE_CONSENSUS_VDF
+# directly. Every other lifecycle test file imports OPERATOR_BOND from here,
+# so this patch is in effect before any of them run.
+contract_mod.MIN_OPERATOR_BOND_UCNPY = 1
 
 
 class FakeState:
@@ -171,6 +180,37 @@ def join_room(contract, state, player, round_id, amount, num_cards=1):
     msg = MessageJoinRoom(player_address=player, round_id=round_id, num_cards=num_cards, amount=amount)
     resp = run(contract._deliver_message_join_room(msg))
     assert not resp.HasField("error"), resp.error.msg
+
+
+class TestOpenRoomBondFloor:
+    """operator_bond must be a real deterrent, not a number the operator can
+    set to 1 to opt out of it -- see the audit finding this guards against."""
+
+    def test_bond_below_the_flat_floor_rejected(self, contract, state, monkeypatch):
+        monkeypatch.setattr(contract_mod, "MIN_OPERATOR_BOND_UCNPY", 10_000_000)
+        fund_operator(contract.plugin, 1)
+        msg = MessageOpenRoom(operator_address=ADMIN, round_id=b"round001", commitment=b"c" * 32,
+                              entry_fee=100, rake_bps=1000, payout_weights_bps=[10000],
+                              operator_bond=1)
+        with pytest.raises(PluginError, match="operator_bond must be at least"):
+            contract._check_message_open_room(msg)
+
+    def test_bond_below_entry_fee_rejected_even_above_the_flat_floor(self, contract, state, monkeypatch):
+        monkeypatch.setattr(contract_mod, "MIN_OPERATOR_BOND_UCNPY", 10)
+        fund_operator(contract.plugin, 50)
+        msg = MessageOpenRoom(operator_address=ADMIN, round_id=b"round001", commitment=b"c" * 32,
+                              entry_fee=100_000, rake_bps=1000, payout_weights_bps=[10000],
+                              operator_bond=50)
+        with pytest.raises(PluginError, match="operator_bond must be at least 100000"):
+            contract._check_message_open_room(msg)
+
+    def test_bond_meeting_the_higher_of_the_two_floors_accepted(self, contract, state, monkeypatch):
+        monkeypatch.setattr(contract_mod, "MIN_OPERATOR_BOND_UCNPY", 10)
+        msg = MessageOpenRoom(operator_address=ADMIN, round_id=b"round001", commitment=b"c" * 32,
+                              entry_fee=100_000, rake_bps=1000, payout_weights_bps=[10000],
+                              operator_bond=100_000)
+        resp = contract._check_message_open_room(msg)
+        assert list(resp.authorized_signers) == [ADMIN]
 
 
 class TestSettleRoomHappyPath:

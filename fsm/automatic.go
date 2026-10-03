@@ -28,8 +28,13 @@ func (s *StateMachine) BeginBlock(lastBlockHash []byte) (lib.Events, lib.ErrorI)
 	// computed over the block before it), never from the applying header: the
 	// applying header's VDF is over lastBlockHash and is not yet known when the
 	// proposer computes the state root. The predecessor hash still prefers a
-	// non-empty applying-header value so a malformed one is rejected by the
-	// plugin rather than silently replaced.
+	// non-empty applying-header value; a forged one is caught not here but
+	// by the pre-existing, unrelated consensus safeguard in
+	// controller/block.go (ErrUnequalBlockHash), which independently
+	// recomputes the header from its own trusted store and rejects a
+	// mismatch, discarding the ephemeral write batch. The plugin itself
+	// only checks last_block_hash's length (see contract.py begin_block),
+	// not its correctness.
 	var vdfOutput []byte
 	if s.height > 1 {
 		lastBlock, err := s.LoadBlock(s.height - 1)

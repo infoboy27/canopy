@@ -133,6 +133,18 @@ SETTLE_GRACE_BLOCKS = 720
 REQUIRE_CONSENSUS_VDF = os.environ.get(
     "CANASINO_REQUIRE_CONSENSUS_VDF", "").strip().lower() in ("1", "true", "yes")
 
+# Minimum operator bond, in micro-CNPY. Without a floor, ADMIN_ADDRESSES being
+# a single operator-controlled key means the same party deciding whether to
+# abandon an unfavorable round also chooses how much skin they put in when
+# opening it -- an operator could set operator_bond=1 and make "selectively
+# settle only favorable outcomes, forfeit the trivial bond on the rest"
+# effectively free, defeating the deterrent this bond exists to create.
+# Bingo/Domino/Poker additionally require the bond to be at least the round's
+# own per-player stake (entry_fee / buy_in), whichever is larger; Roulette has
+# no stake amount at open time (bets are placed afterward at variable sizes),
+# so only the flat floor applies there.
+MIN_OPERATOR_BOND_UCNPY = 10_000_000  # 10 CNPY
+
 
 # Plugin configuration (matching Go's ContractConfig)
 CONTRACT_CONFIG = {
@@ -471,12 +483,12 @@ class Contract:
                 return response
             if len(request.last_block_hash) != 32:
                 raise PluginError(
-                    1, "canasino",
+                    1, "plugin",
                     "missing or invalid consensus last block hash",
                 )
             if not self.plugin:
                 raise PluginError(
-                    1, "canasino",
+                    1, "plugin",
                     "plugin not initialized for consensus entropy",
                 )
             predecessor_height = request.height - 1
@@ -530,12 +542,12 @@ class Contract:
             v = by_height.get(h)
             if v is None or len(v) < 32:
                 return None, PluginError(
-                    1, "canasino",
+                    1, "plugin",
                     f"consensus entropy for height {h} is not available",
                 )
             if REQUIRE_CONSENSUS_VDF and len(v) == 32:
                 return None, PluginError(
-                    1, "canasino",
+                    1, "plugin",
                     f"consensus VDF for height {h} is not available",
                 )
             window.append(v)
@@ -1179,8 +1191,9 @@ class Contract:
             raise PluginError(1, "plugin", "payout_weights_bps must sum to 10000")
         if any(w == 0 for w in msg.payout_weights_bps):
             raise PluginError(1, "plugin", "payout weights must be positive")
-        if msg.operator_bond == 0:
-            raise PluginError(1, "plugin", "operator_bond must be positive")
+        min_bond = max(MIN_OPERATOR_BOND_UCNPY, msg.entry_fee)
+        if msg.operator_bond < min_bond:
+            raise PluginError(1, "plugin", f"operator_bond must be at least {min_bond}")
         r = PluginCheckResponse()
         r.authorized_signers.append(msg.operator_address)
         return r
@@ -1511,8 +1524,8 @@ class Contract:
         # "operate" a room), not something to carry into a new message type.
         if msg.operator_address not in ADMIN_ADDRESSES:
             raise err_unauthorized_signer()
-        if msg.operator_bond == 0:
-            raise PluginError(1, "plugin", "operator_bond must be positive")
+        if msg.operator_bond < MIN_OPERATOR_BOND_UCNPY:
+            raise PluginError(1, "plugin", f"operator_bond must be at least {MIN_OPERATOR_BOND_UCNPY}")
         r = PluginCheckResponse()
         r.authorized_signers.append(msg.operator_address)
         return r
@@ -1871,8 +1884,9 @@ class Contract:
             raise PluginError(1, "plugin", "rake_bps must be <= 10000")
         if msg.operator_address not in ADMIN_ADDRESSES:
             raise err_unauthorized_signer()
-        if msg.operator_bond == 0:
-            raise PluginError(1, "plugin", "operator_bond must be positive")
+        min_bond = max(MIN_OPERATOR_BOND_UCNPY, msg.entry_fee)
+        if msg.operator_bond < min_bond:
+            raise PluginError(1, "plugin", f"operator_bond must be at least {min_bond}")
         r = PluginCheckResponse()
         r.authorized_signers.append(msg.operator_address)
         return r
@@ -2175,8 +2189,9 @@ class Contract:
             raise PluginError(1, "plugin", "rake_bps must be <= 10000")
         if msg.operator_address not in ADMIN_ADDRESSES:
             raise err_unauthorized_signer()
-        if msg.operator_bond == 0:
-            raise PluginError(1, "plugin", "operator_bond must be positive")
+        min_bond = max(MIN_OPERATOR_BOND_UCNPY, msg.buy_in)
+        if msg.operator_bond < min_bond:
+            raise PluginError(1, "plugin", f"operator_bond must be at least {min_bond}")
         r = PluginCheckResponse()
         r.authorized_signers.append(msg.operator_address)
         return r
