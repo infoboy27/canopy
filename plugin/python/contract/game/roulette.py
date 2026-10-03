@@ -88,3 +88,13 @@ def payout_for(bet_type: str, bet_number: int, amount: int, spin: int) -> int:
     if not bet_wins(bet_type, bet_number, spin):
         return 0
     return amount * _PAYOUT_MULTIPLIER[bet_type]
+
+
+def liability_reserve(bet_type: str, amount: int) -> int:
+    """Treasury funds locked with a stake so its maximum gross payout is funded.
+
+    The player's stake already covers one unit of the gross payout.  Locking
+    the remaining ``multiplier - 1`` units is deliberately conservative: rake
+    is not counted as available until settlement has actually succeeded.
+    """
+    return amount * (_PAYOUT_MULTIPLIER[bet_type] - 1)

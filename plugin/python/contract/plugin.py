@@ -387,7 +387,7 @@ class Plugin:
 
             elif msg.HasField("begin"):
                 logger.debug(f"Received begin request from FSM (H:{msg.begin.height})")
-                result = contract.begin_block(msg.begin)
+                result = await contract.begin_block(msg.begin)
                 response = PluginToFSM()
                 response.id = msg.id
                 response.begin.CopyFrom(result)

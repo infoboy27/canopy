@@ -378,7 +378,7 @@ func TestBeginBlockResetsRestrictedTxCount(t *testing.T) {
 	restrictedTxCount.Set(2)
 	sm.Metrics = &lib.Metrics{FSMMetrics: lib.FSMMetrics{RestrictedTxCount: restrictedTxCount}}
 
-	_, err := sm.BeginBlock()
+	_, err := sm.BeginBlock(nil)
 	require.NoError(t, err)
 	metric := new(dto.Metric)
 	require.NoError(t, restrictedTxCount.Write(metric))

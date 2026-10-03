@@ -113,6 +113,17 @@ func TestBeginBlock(t *testing.T) {
 				}
 				require.NoError(t, sm.store.(lib.StoreI).IndexQC(qc))
 			}
+			// BeginBlock resolves the predecessor hash and its consensus VDF
+			// output from the FSM index, so above genesis the prior block must
+			// already be indexed.
+			if !test.isGenesis {
+				require.NoError(t, sm.store.(lib.StoreI).IndexBlock(&lib.BlockResult{
+					BlockHeader: &lib.BlockHeader{
+						Height: sm.height,
+						Hash:   crypto.Hash([]byte("indexed predecessor")),
+					},
+				}))
+			}
 			// commit the store
 			_, err := sm.store.(lib.StoreI).Commit()
 			require.NoError(t, err)
@@ -125,7 +136,7 @@ func TestBeginBlock(t *testing.T) {
 			}
 			// get last validator set for begin block
 			// ensure expected error on function call
-			_, err = sm.BeginBlock()
+			_, err = sm.BeginBlock(nil)
 			if test.error != nil {
 				return
 			}

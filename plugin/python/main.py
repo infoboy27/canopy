@@ -36,5 +36,10 @@ async def main() -> None:
     await plugin.close()
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Synchronous console-script entry point."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()
