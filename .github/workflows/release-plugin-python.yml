@@ -42,6 +42,27 @@ jobs:
           echo "tag=${PREFIX}${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Version '$VERSION' is valid. Release tag: ${PREFIX}${VERSION}"
 
+      - name: Require a version higher than every existing plugin-python release
+        env:
+          NEW_TAG: ${{ steps.compute.outputs.tag }}
+        run: |
+          # The validator's auto-updater only applies a release whose semver is GREATER
+          # than the one installed, and it discards anything else silently. This repo has
+          # both v0.x.y and v2026.DDD.N tags, and semver compares major first, so a
+          # "v0.6.0" can never beat "v2026.277.1": it would publish fine and never deploy.
+          # See plugin/python/RELEASING.md.
+          git ls-remote --tags origin 'refs/tags/plugin-python-v*' | sed 's|.*refs/tags/||; s|\^{}$||' | sort -u > existing.txt
+          if grep -qx "$NEW_TAG" existing.txt; then
+            echo "::error::Tag $NEW_TAG already exists."; exit 1
+          fi
+          HIGHEST=$(sort -V existing.txt | tail -n1)
+          TOP=$(printf '%s\n%s\n' "$HIGHEST" "$NEW_TAG" | sort -V | tail -n1)
+          if [ -n "$HIGHEST" ] && [ "$TOP" != "$NEW_TAG" ]; then
+            echo "::error::$NEW_TAG does not exceed the highest existing release ($HIGHEST). The validator auto-updater would silently ignore it. Use the date-based scheme, e.g. 2026.<day-of-year>.<n> (see plugin/python/RELEASING.md)."
+            exit 1
+          fi
+          echo "OK: $NEW_TAG > ${HIGHEST:-<none>}"
+
   release:
     name: Build and Release Python Plugin
     runs-on: ubuntu-latest
